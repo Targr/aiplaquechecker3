@@ -25,14 +25,14 @@
 <div class="container mt-4">
   <h1 class="text-center mb-4">Plaque / Colony AI Counter — Review Mode</h1>
 
-  <!-- Single Image Processing (unchanged other than annotated review flow) -->
+  <!-- Single Image Processing (unchanged other than original image b64 returned) -->
   <div class="card mb-4">
     <div class="card-body">
       <h5>Single Image Processing</h5>
       <form id="singleForm">
         <div class="mb-2">
           <label class="form-label">Upload Image or Take Photo</label>
-          <input class="form-control" id="singleImageInput" type="file" name="image" required accept="image/*" capture="environment">
+          <input class="form-control" type="file" name="image" required accept="image/*" capture="environment">
         </div>
         <div class="mb-2">
           <label class="form-label">Reference Images (Optional)</label>
@@ -229,53 +229,55 @@ function renderResults(data, resultDiv) {
 }
 
 /* -----------------------
-   Single image handler (modified: if "Multiple Plates" checked -> open annotation modal instead of direct process)
+   Single image handler (modified to open annotation modal when requested)
    ----------------------- */
-const singleForm = document.getElementById('singleForm');
-const singleImageInput = document.getElementById('singleImageInput');
-let singleReviewMode = false;
-let singleImageB64 = '';
-let singleImageName = '';
-let singleResultDiv = document.getElementById('singleResult');
-let singleSelectedColors = [];
+let singleMode = false;
+let singleImageB64 = null;
+let singleImageName = null;
 
-singleForm.addEventListener('submit', async (e) => {
+document.getElementById('singleForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const formData = new FormData(e.target);
+  const form = e.target;
   const multiPlate = document.getElementById("multiPlateSingle").checked;
-  formData.append("confidence", document.getElementById('singleConfidence').value);
-  formData.append("colors", JSON.stringify(getSelectedColors(e.target)));
+  const colors = JSON.stringify(getSelectedColors(form));
+  const conf = document.getElementById('singleConfidence').value;
+
+  // if Multi-Plate checkbox is checked, open the annotation modal for drawing
+  if (multiPlate) {
+    // read the uploaded image as base64 and open modal
+    const fileInput = form.querySelector('input[type="file"][name="image"]');
+    if (!fileInput.files || fileInput.files.length === 0) {
+      document.getElementById('singleResult').innerHTML = '<div class="text-danger">No image chosen</div>';
+      return;
+    }
+    const file = fileInput.files[0];
+    const reader = new FileReader();
+    reader.onload = function(ev) {
+      const dataUrl = ev.target.result; // "data:image/png;base64,...."
+      const b64 = dataUrl.split(',')[1];
+      singleMode = true;
+      singleImageB64 = b64;
+      singleImageName = file.name || ('image_single');
+      openAnnotationModalForSingle(b64, singleImageName);
+    };
+    reader.readAsDataURL(file);
+    return;
+  }
+
+  // otherwise normal process call
+  const formData = new FormData(form);
+  formData.append("confidence", conf);
+  formData.append("colors", colors);
   formData.append("multi_plate", multiPlate);
 
-  if (!multiPlate) {
-    // existing behaviour: send to /api/process
-    singleResultDiv.innerHTML = 'Processing...';
-    try {
-      const data = await postFormData('/api/process', formData);
-      renderResults(data, singleResultDiv);
-    } catch (err) {
-      singleResultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
-    }
-    return;
+  const resultDiv = document.getElementById('singleResult');
+  resultDiv.innerHTML = 'Processing...';
+  try {
+    const data = await postFormData('/api/process', formData);
+    renderResults(data, resultDiv);
+  } catch (err) {
+    resultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
   }
-
-  // If multiPlate is checked: open annotation modal for user to draw boxes
-  const fileInput = singleImageInput.files[0];
-  if (!fileInput) {
-    singleResultDiv.innerHTML = `<div class="text-danger">Please choose an image first.</div>`;
-    return;
-  }
-  singleImageName = fileInput.name || 'single_image';
-  singleSelectedColors = getSelectedColors(singleForm);
-
-  // read as dataURL
-  const reader = new FileReader();
-  reader.onload = function(ev) {
-    const dataUrl = ev.target.result; // "data:image/png;base64,...."
-    singleImageB64 = dataUrl.split(',')[1];
-    openAnnotationModalForSingle(singleImageB64, singleImageName);
-  };
-  reader.readAsDataURL(fileInput);
 });
 
 /* -----------------------
@@ -361,7 +363,7 @@ document.getElementById('batchForm').addEventListener('submit', async (e) => {
 });
 
 /* -----------------------
-   Annotation modal logic (shared)
+   Annotation modal logic (reused for single + batch)
    ----------------------- */
 const annotModalEl = document.getElementById('annotModal');
 const bsModal = new bootstrap.Modal(annotModalEl, { backdrop: 'static', keyboard: false });
@@ -374,7 +376,7 @@ let boxes = []; // {x1,y1,x2,y2,label_id}
 let selectedBoxIdx = null;
 let drawing = false;
 let drawStart = null;
-let currentBatchIndex = null;
+let currentBatchIndex = null; // integer when batch mode; null in singleMode
 const boxListDiv = document.getElementById('boxList');
 const labelSelect = document.getElementById('labelSelect');
 
@@ -389,9 +391,9 @@ function populateLabelSelect() {
 }
 populateLabelSelect();
 
-// open modal for given batch index (existing)
+// open modal for given batch index (existing function)
 function openAnnotationModal(batchIndex) {
-  if (!lastBatchData) return;
+  singleMode = false;
   currentBatchIndex = batchIndex;
   const imgData = lastBatchData.results[batchIndex];
   document.getElementById('annotImageName').textContent = imgData.image_name || ('Image ' + (batchIndex+1));
@@ -400,7 +402,6 @@ function openAnnotationModal(batchIndex) {
   const imgB64 = imgData.original_image_base64 || imgData.annotated_image_base64;
   canvasImage = new Image();
   canvasImage.onload = () => {
-    // size canvas to image (fit to modal width while keeping aspect)
     const maxW = 800;
     const ratio = Math.min(maxW / canvasImage.width, 1);
     canvasScale = ratio;
@@ -420,16 +421,19 @@ function openAnnotationModal(batchIndex) {
     boxes.push({ x1, y1, x2, y2, label_id });
   });
   selectedBoxIdx = null;
-  singleReviewMode = false; // ensure batch mode
   updateBoxList();
   redrawCanvas();
   bsModal.show();
 }
 
-// open modal for single-image review
-function openAnnotationModalForSingle(imageB64NoPrefix, imageName) {
+// open modal for single image (new)
+function openAnnotationModalForSingle(imageB64, imageName) {
+  singleMode = true;
   currentBatchIndex = null;
-  document.getElementById('annotImageName').textContent = imageName || 'Single Image';
+  singleImageB64 = imageB64;
+  singleImageName = imageName;
+  document.getElementById('annotImageName').textContent = imageName;
+
   canvasImage = new Image();
   canvasImage.onload = () => {
     const maxW = 800;
@@ -439,12 +443,11 @@ function openAnnotationModalForSingle(imageB64NoPrefix, imageName) {
     canvas.height = Math.round(canvasImage.height * canvasScale);
     redrawCanvas();
   };
-  canvasImage.src = "data:image/png;base64," + imageB64NoPrefix;
+  canvasImage.src = "data:image/png;base64," + imageB64;
 
-  // start with no boxes (user will draw)
+  // start with no boxes (user will draw them)
   boxes = [];
   selectedBoxIdx = null;
-  singleReviewMode = true;
   updateBoxList();
   redrawCanvas();
   bsModal.show();
@@ -455,7 +458,6 @@ canvas.addEventListener('mousedown', (ev) => {
   const r = canvas.getBoundingClientRect();
   const x = (ev.clientX - r.left) / canvasScale;
   const y = (ev.clientY - r.top) / canvasScale;
-  // start drawing a new box
   drawing = true;
   drawStart = { x, y };
 });
@@ -470,7 +472,6 @@ canvas.addEventListener('mousemove', (ev) => {
   const x2 = Math.max(drawStart.x, x);
   const y2 = Math.max(drawStart.y, y);
   redrawCanvas();
-  // draw the in-progress rectangle (unscaled coords)
   ctx.strokeStyle = 'lime';
   ctx.lineWidth = 2;
   ctx.strokeRect(x1*canvasScale, y1*canvasScale, (x2-x1)*canvasScale, (y2-y1)*canvasScale);
@@ -486,9 +487,7 @@ canvas.addEventListener('mouseup', (ev) => {
   const y1 = Math.round(Math.min(drawStart.y, y));
   const x2 = Math.round(Math.max(drawStart.x, x));
   const y2 = Math.round(Math.max(drawStart.y, y));
-  // add to boxes with currently-selected label
   const label_id = parseInt(labelSelect.value || 0);
-  // ignore tiny boxes
   if (Math.abs(x2-x1) > 4 && Math.abs(y2-y1) > 4) {
     boxes.push({ x1, y1, x2, y2, label_id });
     selectedBoxIdx = boxes.length - 1;
@@ -498,7 +497,6 @@ canvas.addEventListener('mouseup', (ev) => {
 });
 
 canvas.addEventListener('click', (ev) => {
-  // allow selection of a box by clicking inside
   const r = canvas.getBoundingClientRect();
   const x = (ev.clientX - r.left) / canvasScale;
   const y = (ev.clientY - r.top) / canvasScale;
@@ -521,17 +519,14 @@ canvas.addEventListener('click', (ev) => {
 });
 
 function redrawCanvas() {
-  // draw base image
   ctx.clearRect(0,0,canvas.width,canvas.height);
   if (canvasImage.width) ctx.drawImage(canvasImage, 0, 0, canvas.width, canvas.height);
 
-  // draw boxes
   boxes.forEach((b, idx) => {
     const x = b.x1*canvasScale, y = b.y1*canvasScale, w = (b.x2-b.x1)*canvasScale, h = (b.y2-b.y1)*canvasScale;
     ctx.lineWidth = (idx === selectedBoxIdx) ? 3 : 2;
     ctx.strokeStyle = (idx === selectedBoxIdx) ? 'red' : 'yellow';
     ctx.strokeRect(x, y, w, h);
-    // label background
     const lbl = `${b.label_id}:${CLASS_NAMES[b.label_id]||''}`;
     ctx.fillStyle = 'rgba(0,0,0,0.6)';
     ctx.fillRect(x, y-18, Math.min(200, ctx.measureText(lbl).width + 8), 18);
@@ -594,12 +589,35 @@ document.getElementById('cancelCorrectionBtn').addEventListener('click', () => {
   bsModal.hide();
 });
 
-/* Save correction: sends to /api/count_manual if singleReviewMode, else /api/save_correction (existing) */
+/* Save correction: send to backend
+   Now supports both batch + single flows
+*/
 document.getElementById('saveCorrectionBtn').addEventListener('click', async () => {
-  // prepare image bytes and boxes
+  // determine mode and image context
+  let imageName, imageB64, imageW, imageH;
+  if (singleMode) {
+    if (!singleImageB64) return alert('No single image loaded');
+    imageName = singleImageName || 'single_image';
+    imageB64 = singleImageB64;
+    imageW = canvasImage.width;
+    imageH = canvasImage.height;
+  } else {
+    if (!lastBatchData || (currentBatchIndex !== 0 && !currentBatchIndex)) {
+      // allow zero index
+      if (currentBatchIndex !== 0 && !currentBatchIndex) return alert('No batch image selected');
+    }
+    const imgData = lastBatchData.results[currentBatchIndex];
+    imageName = imgData.image_name || `img_${currentBatchIndex}`;
+    // prefer original image if available to save highest fidelity
+    imageB64 = (imgData.original_image_base64 || imgData.annotated_image_base64);
+    imageW = canvasImage.width;
+    imageH = canvasImage.height;
+  }
+
+  // create base64 capture from canvas for saved image
   const dataUrl = canvas.toDataURL('image/png');
-  const b64 = dataUrl.split(',')[1]; // base64 content
-  const imgW = canvasImage.width, imgH = canvasImage.height;
+  const savedB64 = dataUrl.split(',')[1];
+
   const outBoxes = boxes.map(b => ({
     x1: Math.round(b.x1),
     y1: Math.round(b.y1),
@@ -608,70 +626,48 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
     label_id: Number(b.label_id)
   }));
 
-  if (singleReviewMode) {
-    // call /api/count_manual and show results in singleResultDiv
-    const payload = {
-      image_b64: b64,
-      boxes: outBoxes,
-      colors: singleSelectedColors.length ? singleSelectedColors : undefined
-    };
-    try {
-      const res = await fetch('/api/count_manual', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || `HTTP ${res.status}`);
-      }
-      const resp = await res.json();
-      // Display manual count and annotated image
-      let html = `<h5>Manual Count Result</h5>`;
-      html += `<p><strong>Total plates marked:</strong> ${resp.manual_count}</p>`;
-      if (resp.annotated_image_base64) {
-        html += `<img class="img-preview" src="data:image/png;base64,${resp.annotated_image_base64}">`;
-      }
-      if (resp.color_counts) {
-        html += '<h6>Color counts</h6><ul>' + Object.entries(resp.color_counts).map(([c,v]) => `<li>${c}: ${v}</li>`).join('') + '</ul>';
-      }
-      if (resp.per_box) {
-        html += `<details><summary>Per-box metadata (${resp.per_box.length})</summary><pre>${JSON.stringify(resp.per_box, null, 2)}</pre></details>`;
-      }
-      singleResultDiv.innerHTML = html;
-      bsModal.hide();
-      singleReviewMode = false;
-    } catch (err) {
-      alert('Failed to submit manual count: ' + err.message);
-    }
-    return;
-  }
-
-  // Otherwise: batch/save behavior (keep original behavior)
-  if (currentBatchIndex === null && currentBatchIndex !== 0) {
-    return alert('No batch index in context');
-  }
-  const payloadSave = {
-    image_name: lastBatchData.results[currentBatchIndex].image_name || `img_${currentBatchIndex}`,
-    image_b64: b64,
-    image_width: imgW,
-    image_height: imgH,
+  const payload = {
+    image_name: imageName,
+    image_b64: savedB64,
+    image_width: imageW,
+    image_height: imageH,
     boxes: outBoxes
   };
+
   try {
     const res = await fetch('/api/save_correction', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payloadSave)
+      body: JSON.stringify(payload)
     });
     if (!res.ok) {
       const txt = await res.text();
       throw new Error(txt || `HTTP ${res.status}`);
     }
     const resp = await res.json();
-    // mark as corrected in lastBatchData so UI shows badge
-    lastBatchData.results[currentBatchIndex].__corrected = true;
-    alert('Saved correction: ' + (resp.saved_label_file || 'saved'));
+    // mark corrected in UI for batch
+    if (!singleMode && lastBatchData && lastBatchData.results && lastBatchData.results[currentBatchIndex]) {
+      lastBatchData.results[currentBatchIndex].__corrected = true;
+    }
+    // If singleMode: show counts in singleResult area
+    if (singleMode) {
+      let infoHtml = '<h6>Manual counts saved</h6>';
+      if (resp.manual_result) {
+        infoHtml += `<p>Manual count: ${resp.manual_result.manual_count}</p>`;
+        if (resp.manual_result.color_counts) {
+          infoHtml += '<ul>' + Object.entries(resp.manual_result.color_counts).map(([c,v]) => `<li>${c}: ${v}</li>`).join('') + '</ul>';
+        }
+        infoHtml += `<img class="img-preview mt-2" src="data:image/png;base64,${resp.manual_result.annotated_image_base64}">`;
+      }
+      document.getElementById('singleResult').innerHTML = infoHtml;
+    } else {
+      // re-render batch viewer so corrected badge appears
+      const evt = new Event('submit');
+      // re-render current batch UI by reusing lastBatchData (no fresh server call)
+      document.getElementById('batchForm').dispatchEvent(evt);
+      // But to avoid re-submitting form, simply close modal and notify user
+      alert('Saved correction: ' + (resp.saved_label_file || 'saved'));
+    }
     bsModal.hide();
   } catch (err) {
     alert('Failed to save correction: ' + err.message);
