@@ -435,23 +435,24 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
 
-    function redrawCanvas(){
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  if(canvasImage.width) ctx.drawImage(canvasImage,0,0,canvas.width,canvas.height);
-  boxes.forEach((b,idx)=>{
-    const x=b.x1, y=b.y1, w=b.x2-b.x1, h=b.y2-b.y1;
-    ctx.lineWidth = (idx===selectedBoxIdx)?3:2;
-    ctx.strokeStyle=(idx===selectedBoxIdx)?'red':'yellow';
-    ctx.strokeRect(x,y,w,h);
-    const lbl=`${b.label_id}:${CLASS_NAMES[b.label_id]||''}`;
-    ctx.fillStyle='rgba(0,0,0,0.6)';
-    ctx.fillRect(x,y-18,Math.min(200,ctx.measureText(lbl).width+8),18);
-    ctx.fillStyle='white';
-    ctx.font='14px sans-serif';
-    ctx.fillText(lbl,x+4,y-4);
-  });
-}
-
+    function redrawCanvas() {
+      if (!ctx && canvas) ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      if (canvasImage && canvasImage.width) ctx.drawImage(canvasImage, 0, 0, canvas.width, canvas.height);
+      boxes.forEach((b, idx) => {
+        const x = b.x1*canvasScale, y = b.y1*canvasScale, w = (b.x2-b.x1)*canvasScale, h = (b.y2-b.y1)*canvasScale;
+        ctx.lineWidth = (idx===selectedBoxIdx)?3:2;
+        ctx.strokeStyle = (idx===selectedBoxIdx)?'red':'yellow';
+        ctx.strokeRect(x,y,w,h);
+        const lbl = `${b.label_id}:${CLASS_NAMES[b.label_id]||''}`;
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        const boxW = Math.min(200, ctx.measureText(lbl).width + 8);
+        ctx.fillRect(x, y-18, boxW, 18);
+        ctx.fillStyle = 'white'; ctx.font = '14px sans-serif';
+        ctx.fillText(lbl, x+4, y-4);
+      });
+    }
 
     function updateBoxList() {
       if (!boxListDiv) return;
