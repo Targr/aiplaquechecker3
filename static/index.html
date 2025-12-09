@@ -238,6 +238,10 @@ let singleImageName = null;
 /* Move declaration of currentBatchIndex up so it's available to handlers */
 let currentBatchIndex = null; // integer when batch mode; null in singleMode
 
+// HOISTED IMAGE VARS: use var so they are available before any function runs
+var canvasImage = new Image();
+var canvasScale = 1;
+
 document.getElementById('singleForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -394,9 +398,7 @@ const bsModal = new bootstrap.Modal(annotModalEl, { backdrop: 'static', keyboard
 
 const canvas = document.getElementById('annotCanvas');
 const ctx = canvas.getContext('2d');
-let canvasImage = new Image();
-let canvasScale = 1;
-let boxes = []; // {x1,y1,x2,y2,label_id}
+var boxes = []; // {x1,y1,x2,y2,label_id}
 let selectedBoxIdx = null;
 let drawing = false;
 let drawStart = null;
