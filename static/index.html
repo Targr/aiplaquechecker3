@@ -235,6 +235,9 @@ let singleMode = false;
 let singleImageB64 = null;
 let singleImageName = null;
 
+/* Move declaration of currentBatchIndex up so it's available to handlers */
+let currentBatchIndex = null; // integer when batch mode; null in singleMode
+
 document.getElementById('singleForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -397,7 +400,6 @@ let boxes = []; // {x1,y1,x2,y2,label_id}
 let selectedBoxIdx = null;
 let drawing = false;
 let drawStart = null;
-let currentBatchIndex = null; // integer when batch mode; null in singleMode
 const boxListDiv = document.getElementById('boxList');
 const labelSelect = document.getElementById('labelSelect');
 
@@ -636,8 +638,12 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
     imageW = canvasImage.width;
     imageH = canvasImage.height;
   } else {
-    if (!lastBatchData || (currentBatchIndex !== 0 && !currentBatchIndex)) {
-      if (currentBatchIndex !== 0 && !currentBatchIndex) return alert('No batch image selected');
+    // safe check for batch selection
+    if (typeof currentBatchIndex !== 'number' || currentBatchIndex === null) {
+      return alert('No batch image selected');
+    }
+    if (!lastBatchData || !lastBatchData.results || !lastBatchData.results[currentBatchIndex]) {
+      return alert('No batch image data available');
     }
     const imgData = lastBatchData.results[currentBatchIndex];
     imageName = imgData.image_name || `img_${currentBatchIndex}`;
