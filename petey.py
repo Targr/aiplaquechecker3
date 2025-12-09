@@ -1,713 +1,498 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Plaque/Colony AI Counter (with Review)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>
-    body { background: #f8f9fa; padding-bottom: 40px; }
-    .img-preview { max-width: 100%; height: auto; border: 1px solid #ccc; margin-top: 10px; }
-    pre { white-space: pre-wrap; word-wrap: break-word; }
-    .slider-container { text-align: center; margin-top: 20px; }
-    #batchImage { max-height: 500px; object-fit: contain; }
-    .color-checkbox { margin-right: 10px; }
-    /* Modal / annotation canvas */
-    #annotModal .modal-dialog { max-width: 900px; }
-    #annotCanvas { border: 1px solid #333; display: block; max-width: 100%; }
-    .box-list { max-height: 200px; overflow: auto; }
-    .box-item { border-bottom: 1px solid #eee; padding: 6px; }
-    .corrected-badge { font-size: 0.8rem; margin-left: 8px; }
-  </style>
-</head>
-<body>
+#!/usr/bin/env python3
+import io
+import os
+import base64
+import shutil
+import json
+from typing import List, Dict, Tuple, Any
+import cv2
 
-<div class="container mt-4">
-  <h1 class="text-center mb-4">Plaque / Colony AI Counter — Review Mode</h1>
+from flask import Flask, request, jsonify, send_from_directory
+from PIL import Image, ImageDraw
+import numpy as np
+import pandas as pd
+from ultralytics import YOLO
+import zipfile
+from collections import Counter
 
-  <!-- Single Image Processing -->
-  <div class="card mb-4">
-    <div class="card-body">
-      <h5>Single Image Processing</h5>
-      <form id="singleForm">
-        <div class="mb-2">
-          <label class="form-label">Upload Image or Take Photo</label>
-          <input class="form-control" type="file" name="image" required accept="image/*" capture="environment">
-        </div>
-        <div class="mb-2">
-          <label class="form-label">Reference Images (Optional)</label>
-          <input class="form-control" type="file" name="references" multiple accept="image/*">
-        </div>
+# --- Flask App ---
+app = Flask(__name__, static_folder="static", static_url_path="/")
 
-        <div class="mb-3">
-          <label for="singleConfidence" class="form-label">
-            Detection Confidence: <span id="singleConfValue">0.25</span>
-          </label>
-          <input type="range" class="form-range" id="singleConfidence" min="0" max="1" step="0.01" value="0.25">
-        </div>
+# --- Load YOLO model ---
+MODEL_PATH = os.path.expanduser("~/Downloads/finetune_beseech_continue/weights/best.pt")
+yolo_model = YOLO(MODEL_PATH)
 
-        <div class="form-check mb-3">
-          <input class="form-check-input" type="checkbox" id="multiPlateSingle">
-          <label class="form-check-label" for="multiPlateSingle">
-            Multiple Plates in this Image
-          </label>
-        </div>
+# --- Class names from the YOLO model ---
+CLASS_NAMES = [yolo_model.names[i] for i in sorted(yolo_model.names.keys())] if isinstance(yolo_model.names, dict) else list(yolo_model.names)
+CLASS_NAME_TO_ID = {name: idx for idx, name in enumerate(CLASS_NAMES)}
 
-        <div class="mb-3">
-          <label class="form-label">Select Colors to Count:</label><br>
-          <input type="checkbox" class="color-checkbox" value="red"> Red
-          <input type="checkbox" class="color-checkbox" value="green"> Green
-          <input type="checkbox" class="color-checkbox" value="blue"> Blue
-          <input type="checkbox" class="color-checkbox" value="yellow"> Yellow
-          <input type="checkbox" class="color-checkbox" value="orange"> Orange!
-        </div>
+# --------- Image Utils ---------
+def pil_to_base64(pil_img: Image.Image, fmt: str = "PNG") -> str:
+    buf = io.BytesIO()
+    pil_img.save(buf, format=fmt)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        <button type="submit" class="btn btn-primary mt-2 w-100">Process</button>
-      </form>
-      <div id="singleResult" class="mt-3"></div>
-    </div>
-  </div>
+def numpy_to_pil(img_rgb: np.ndarray) -> Image.Image:
+    return Image.fromarray(img_rgb)
 
-  <!-- Batch Upload -->
-  <div class="card">
-    <div class="card-body">
-      <h5>Batch Processing</h5>
-      <form id="batchForm">
-        <div class="mb-2">
-          <label class="form-label">Upload Multiple Images</label>
-          <input class="form-control" type="file" name="images" multiple required accept="image/*">
-        </div>
-        <div class="mb-2">
-          <label class="form-label">Reference Images (Optional)</label>
-          <input class="form-control" type="file" name="references" multiple accept="image/*">
-        </div>
+def base64_to_numpy_image(b64_str: str) -> np.ndarray:
+    # accepts raw base64 PNG/JPG bytes (no data: prefix)
+    img_bytes = base64.b64decode(b64_str)
+    arr = np.asarray(bytearray(img_bytes), dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("Failed to decode image bytes")
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return img_rgb
 
-        <div class="mb-3">
-          <label for="batchConfidence" class="form-label">
-            Detection Confidence: <span id="batchConfValue">0.25</span>
-          </label>
-          <input type="range" class="form-range" id="batchConfidence" min="0" max="1" step="0.01" value="0.25">
-        </div>
+def annotate_image_yolo(img: np.ndarray, detections: List[Dict[str, Any]]) -> Image.Image:
+    pil = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=3)
+        draw.text((x1, max(0, y1 - 10)), f"{det.get('label','') } {det.get('confidence',0):.2f}", fill=(255, 255, 0))
+    return pil
 
-        <div class="form-check mb-3">
-          <input class="form-check-input" type="checkbox" id="multiPlateBatch">
-          <label class="form-check-label" for="multiPlateBatch">
-            Multiple Plates in Each Image
-          </label>
-        </div>
+def annotate_image_with_boxes(img: np.ndarray, boxes: List[Dict[str, Any]]) -> Image.Image:
+    # boxes are dicts with x1,y1,x2,y2 and optional label/confidence
+    pil = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    for b in boxes:
+        x1, y1, x2, y2 = int(b["x1"]), int(b["y1"]), int(b["x2"]), int(b["y2"])
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
+        label = b.get("label", "")
+        conf = b.get("confidence")
+        text = f"{label} {conf:.2f}" if conf is not None else label
+        if text.strip():
+            draw.text((x1, max(0, y1 - 10)), text, fill=(255, 255, 0))
+    return pil
 
-        <div class="mb-3">
-          <label class="form-label">Select Colors to Count:</label><br>
-          <input type="checkbox" class="color-checkbox" value="red"> Red
-          <input type="checkbox" class="color-checkbox" value="green"> Green
-          <input type="checkbox" class="color-checkbox" value="blue"> Blue
-          <input type="checkbox" class="color-checkbox" value="yellow"> Yellow
-          <input type="checkbox" class="color-checkbox" value="orange"> Orange
-        </div>
+def process_yolo(image_bytes: bytes, conf_threshold: float) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    arr = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return [], np.zeros((1,1,3), dtype=np.uint8)
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        <button type="submit" class="btn btn-success mt-2 w-100">Process Batch</button>
-      </form>
-      <div id="batchResult" class="mt-3"></div>
-    </div>
-  </div>
-</div>
+    results = yolo_model.predict(img_rgb, imgsz=640, verbose=False, conf=conf_threshold)[0]
+    detections = []
 
-<!-- Annotation Modal -->
-<div class="modal fade" id="annotModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-xl modal-dialog-centered">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title">Review / Correct Detection — <span id="annotImageName"></span></h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <div class="row">
-          <div class="col-md-8">
-            <canvas id="annotCanvas"></canvas>
-            <div class="mt-2">
-              <small>Instructions: Drag on the image to draw a new bounding box. Click a box to select it. Use "Delete selected" to remove.</small>
-            </div>
-          </div>
-          <div class="col-md-4">
-            <div>
-              <label class="form-label">Label for new box / selected</label>
-              <select id="labelSelect" class="form-select"></select>
-            </div>
-            <div class="mt-2">
-              <button id="deleteBoxBtn" class="btn btn-danger btn-sm">Delete selected</button>
-              <button id="saveCorrectionBtn" class="btn btn-primary btn-sm ms-2">Save Correction</button>
-              <button id="cancelCorrectionBtn" class="btn btn-secondary btn-sm ms-2" data-bs-dismiss="modal">Cancel</button>
-            </div>
-            <hr>
-            <h6>Boxes</h6>
-            <div class="box-list" id="boxList"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
+    img_area = img_rgb.shape[0] * img_rgb.shape[1]
+    max_area = img_area * 0.15  # max 15% of image area
 
-<script>
-/* -----------------------
-   Helper: fetch JSON with error handling
-   ----------------------- */
-async function fetchJson(url, opts) {
-  const res = await fetch(url, opts);
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(txt || `HTTP ${res.status}`);
-  }
-  return res.json();
-}
+    raw_detections = []
+    if hasattr(results, 'boxes') and results.boxes is not None:
+        for box, conf, cls_id in zip(results.boxes.xyxy, results.boxes.conf, results.boxes.cls):
+            x1, y1, x2, y2 = map(int, box)
+            width, height = x2 - x1, y2 - y1
+            area = max(0, width * height)
+            raw_detections.append((x1, y1, x2, y2, width, height, area, float(conf), int(cls_id)))
 
-/* -----------------------
-   Load class names from server
-   ----------------------- */
-let CLASS_NAMES = [];
-let CLASS_NAME_TO_ID = {};
-(async function loadClasses() {
-  try {
-    const data = await fetchJson('/api/classes');
-    CLASS_NAMES = data.classes || [];
-    CLASS_NAMES.forEach((name, idx) => CLASS_NAME_TO_ID[name] = idx);
-  } catch (e) {
-    console.warn('Could not fetch classes:', e.message);
-    CLASS_NAMES = ['feature']; // fallback
-    CLASS_NAME_TO_ID = {'feature': 0};
-  }
-})();
+    if not raw_detections:
+        return [], img_rgb
 
-/* -----------------------
-   Reuse existing helpers from your file: postFormData and slider UI
-   ----------------------- */
-async function postFormData(url, formData) {
-  const res = await fetch(url, { method: 'POST', body: formData });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
+    areas = [d[6] for d in raw_detections]
+    mean_area = np.mean(areas)
+    std_area = np.std(areas) if len(areas) > 1 else 0.0
+    area_cutoff = mean_area + 2 * std_area
 
-document.getElementById('singleConfidence').addEventListener('input', function () {
-  document.getElementById('singleConfValue').textContent = this.value;
-});
-document.getElementById('batchConfidence').addEventListener('input', function () {
-  document.getElementById('batchConfValue').textContent = this.value;
-});
+    for (x1, y1, x2, y2, width, height, area, conf, cls_id) in raw_detections:
+        if area > max_area:
+            continue
+        if std_area > 0 and area > area_cutoff:
+            continue
+        detections.append({
+            "bbox": [x1, y1, x2, y2],
+            "confidence": conf,
+            "label": CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id),
+            "center_x": int((x1 + x2) / 2),
+            "center_y": int((y1 + y2) / 2),
+            "width": width,
+            "height": height,
+            "area": area,
+        })
 
-function getSelectedColors(form) {
-  return Array.from(form.querySelectorAll('.color-checkbox:checked')).map(cb => cb.value);
-}
+    return detections, img_rgb
 
-/* -----------------------
-   Render helpers
-   ----------------------- */
-function renderResults(data, resultDiv) {
-  if (data.plates) {
-    let html = "<h6>Results per Plate:</h6>";
-    data.plates.forEach((plate, idx) => {
-      html += `
-        <div class="mt-3 p-2 border rounded">
-          <h6>Plate ${idx+1}: ${plate.total_features} features</h6>
-          <img class="img-preview" src="data:image/png;base64,${plate.annotated_image_base64}">
-          <details>
-            <summary>Detections</summary>
-            <pre>${JSON.stringify(plate.detections, null, 2)}</pre>
-          </details>
-        </div>
-      `;
-    });
-    resultDiv.innerHTML = html;
-  } else {
-    let imgHtml = `<img class="img-preview" src="data:image/png;base64,${data.annotated_image_base64}">`;
-    let detailsHtml = `<details><summary>Detections</summary><pre>${JSON.stringify(data.detections, null, 2)}</pre></details>`;
-    let colorHtml = '';
-    if (data.color_counts) {
-      colorHtml = '<ul>' + Object.entries(data.color_counts).map(([c,v]) => `<li>${c}: ${v}</li>`).join('') + '</ul>';
-    }
-    resultDiv.innerHTML = `<h6>Results:</h6>${imgHtml}${detailsHtml}${colorHtml}`;
-  }
-}
+# --------- Color counting ---------
+def count_detections_by_color(img_rgb: np.ndarray, detections: List[Dict[str, Any]], color_map: Dict[str, Tuple[int,int,int]]) -> Dict[str, int]:
+    counts = Counter({color: 0 for color in color_map.keys()})
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        # clamp
+        h, w = img_rgb.shape[:2]
+        x1c, y1c, x2c, y2c = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        crop = img_rgb[y1c:y2c, x1c:x2c]
+        if crop.size == 0:
+            continue
+        mean_color = crop.mean(axis=(0,1))
+        closest_color = min(color_map.keys(), key=lambda c: np.linalg.norm(np.array(color_map[c]) - mean_color))
+        counts[closest_color] += 1
+    return dict(counts)
 
-/* -----------------------
-   Single image handler (modified to call /api/process even for multi-plate)
-   ----------------------- */
-let singleMode = false;
-let singleImageB64 = null;
-let singleImageName = null;
+# --------- Manual box processing helper ---------
+def process_manual_boxes_from_bytes(image_bytes: bytes, boxes: List[Dict[str, Any]], user_colors: List[str]=None) -> Dict[str, Any]:
+    """
+    boxes: list of dicts with keys x1,y1,x2,y2 and optional label_id/label
+    returns counts, annotated image b64, per-box metadata, and color counts if requested
+    """
+    arr = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return {"error": "Could not decode image"}
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-/* Move declaration of currentBatchIndex up so it's available to handlers */
-let currentBatchIndex = null; // integer when batch mode; null in singleMode
-
-document.getElementById('singleForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const form = e.target;
-  const multiPlate = document.getElementById("multiPlateSingle").checked;
-  const colors = JSON.stringify(getSelectedColors(form));
-  const conf = document.getElementById('singleConfidence').value;
-
-  // Build a FormData to call /api/process in all cases (so user gets model detections)
-  const fileInput = form.querySelector('input[type="file"][name="image"]');
-  if (!fileInput.files || fileInput.files.length === 0) {
-    document.getElementById('singleResult').innerHTML = '<div class="text-danger">No image chosen</div>';
-    return;
-  }
-  const file = fileInput.files[0];
-
-  // If not multi-plate simply call process and render results (existing behavior)
-  if (!multiPlate) {
-    const formData = new FormData(form);
-    formData.set("confidence", conf);
-    formData.set("colors", colors);
-    formData.set("multi_plate", "false");
-
-    const resultDiv = document.getElementById('singleResult');
-    resultDiv.innerHTML = 'Processing...';
-    try {
-      const data = await postFormData('/api/process', formData);
-      renderResults(data, resultDiv);
-    } catch (err) {
-      resultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
-    }
-    return;
-  }
-
-  // MULTI-PLATE case: call server to get detections then open modal with detections preloaded
-  try {
-    const formData = new FormData();
-    formData.append('image', file);
-    formData.append('confidence', conf);
-    formData.append('colors', colors);
-    formData.append('multi_plate', 'true');
-
-    const resultDiv = document.getElementById('singleResult');
-    resultDiv.innerHTML = 'Processing (getting detections)...';
-
-    const resp = await postFormData('/api/process', formData);
-    // resp should include detections and original_image_base64
-    const imgB64 = resp.original_image_base64 || resp.annotated_image_base64;
-    const detections = resp.detections || [];
-
-    // save single-mode state
-    singleMode = true;
-    // normalize: if resp returns "data:image/..." prefix, strip it
-    singleImageB64 = imgB64.startsWith('data:') ? imgB64.split(',')[1] : imgB64;
-    singleImageName = file.name || 'single_image';
-
-    // open modal prepopulated with detections
-    openAnnotationModalForSingle(singleImageB64, singleImageName, detections);
-
-    // show a compact summary in singleResult
-    resultDiv.innerHTML = `<div class="text-success">Detections loaded into editor (${detections.length}). Draw additional boxes if needed, then Save.</div>`;
-
-  } catch (err) {
-    document.getElementById('singleResult').innerHTML = `<div class="text-danger">Error getting detections: ${err.message}</div>`;
-  }
-});
-
-/* -----------------------
-   Batch processing + review UI
-   ----------------------- */
-let lastBatchData = null; // store response so review can access it
-document.getElementById('batchForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const formData = new FormData(e.target);
-  formData.append("confidence", document.getElementById('batchConfidence').value);
-  formData.append("colors", JSON.stringify(getSelectedColors(e.target)));
-  formData.append("multi_plate", document.getElementById("multiPlateBatch").checked);
-
-  const resultDiv = document.getElementById('batchResult');
-  resultDiv.innerHTML = 'Processing...';
-  try {
-    const data = await postFormData('/api/batch', formData);
-    lastBatchData = data; // hold for reviewer
-    let currentIndex = 0;
-
-    function renderImage() {
-      const imgData = data.results[currentIndex];
-      const correctedBadge = imgData.__corrected ? `<span class="badge bg-success corrected-badge">Corrected</span>` : '';
-      let html = `
-        <div class="slider-container">
-          <div class="d-flex justify-content-between align-items-center">
-            <div>
-              <button class="btn btn-sm btn-outline-secondary me-2" id="prevBtn">Prev</button>
-              <button class="btn btn-sm btn-outline-secondary" id="nextBtn">Next</button>
-              <button class="btn btn-sm btn-warning ms-3" id="reviewBtn">Review / Correct</button>
-            </div>
-            <div><strong>${imgData.image_name || ('Image ' + (currentIndex+1))}</strong> ${correctedBadge}</div>
-          </div>
-          <div class="mt-3 text-center">
-            <img id="batchImage" class="img-preview" src="data:image/png;base64,${imgData.annotated_image_base64}">
-          </div>
-          <div id="batchInfo" class="mt-3 text-start"></div>
-          <div class="mt-2">
-            <a class="btn btn-sm btn-primary" href="data:text/csv;base64,${data.csv_base64}" download="results.csv">Download CSV</a>
-            <a class="btn btn-sm btn-secondary ms-2" href="data:application/zip;base64,${data.zip_base64}" download="annotated_images.zip">Download ZIP</a>
-            <button id="finalizeBtn" class="btn btn-sm btn-success ms-2">Finalize supplemental training data</button>
-          </div>
-        </div>
-      `;
-      resultDiv.innerHTML = html;
-      // info block
-      let infoHtml = `<details><summary>Detections (${imgData.total_features || (imgData.detections||[]).length})</summary>
-                       <pre>${JSON.stringify(imgData.detections || [], null, 2)}</pre></details>`;
-      if (imgData.color_counts) {
-        infoHtml += '<ul>' + Object.entries(imgData.color_counts).map(([c,v]) => `<li>${c}: ${v}</li>`).join('') + '</ul>';
-      }
-      document.getElementById('batchInfo').innerHTML = infoHtml;
-
-      document.getElementById('prevBtn').addEventListener('click', () => {
-        currentIndex = (currentIndex - 1 + data.results.length) % data.results.length;
-        renderImage();
-      });
-      document.getElementById('nextBtn').addEventListener('click', () => {
-        currentIndex = (currentIndex + 1) % data.results.length;
-        renderImage();
-      });
-
-      // review button
-      document.getElementById('reviewBtn').addEventListener('click', () => {
-        openAnnotationModal(currentIndex);
-      });
-
-      // finalize
-      document.getElementById('finalizeBtn').addEventListener('click', async () => {
-        try {
-          const resp = await fetchJson('/api/finalize_supplemental', { method: 'POST' });
-          alert(`Finalized supplemental data. Files moved: ${resp.moved || 0}`);
-        } catch (err) {
-          alert('Error finalizing supplemental data: ' + err.message);
+    per_box = []
+    detections = []
+    h, w = img_rgb.shape[:2]
+    for b in boxes:
+        x1 = int(max(0, min(w, b.get("x1", 0))))
+        y1 = int(max(0, min(h, b.get("y1", 0))))
+        x2 = int(max(0, min(w, b.get("x2", x1+1))))
+        y2 = int(max(0, min(h, b.get("y2", y1+1))))
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        area = width * height
+        label_id = b.get("label_id")
+        label = b.get("label") if b.get("label") else (CLASS_NAMES[label_id] if label_id is not None and label_id < len(CLASS_NAMES) else "")
+        det = {
+            "bbox": [x1, y1, x2, y2],
+            "width": width,
+            "height": height,
+            "area": area,
+            "label": label,
+            "label_id": label_id
         }
-      });
-    }
+        detections.append(det)
+        per_box.append(det)
 
-    renderImage();
-  } catch (err) {
-    resultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
-  }
-});
+    annotated_pil = annotate_image_with_boxes(img_rgb, [{"x1":d["bbox"][0],"y1":d["bbox"][1],"x2":d["bbox"][2],"y2":d["bbox"][3],"label":d.get("label","")} for d in detections])
+    annotated_b64 = pil_to_base64(annotated_pil)
 
-/* -----------------------
-   Annotation modal logic (reused for single + batch)
-   ----------------------- */
-const annotModalEl = document.getElementById('annotModal');
-const bsModal = new bootstrap.Modal(annotModalEl, { backdrop: 'static', keyboard: false });
-
-const canvas = document.getElementById('annotCanvas');
-const ctx = canvas.getContext('2d');
-let canvasImage = new Image();
-let canvasScale = 1;
-let boxes = []; // {x1,y1,x2,y2,label_id}
-let selectedBoxIdx = null;
-let drawing = false;
-let drawStart = null;
-const boxListDiv = document.getElementById('boxList');
-const labelSelect = document.getElementById('labelSelect');
-
-function populateLabelSelect() {
-  labelSelect.innerHTML = '';
-  CLASS_NAMES.forEach((n,idx) => {
-    const opt = document.createElement('option');
-    opt.value = idx;
-    opt.textContent = `${idx}: ${n}`;
-    labelSelect.appendChild(opt);
-  });
-}
-populateLabelSelect();
-
-// open modal for given batch index (existing function)
-function openAnnotationModal(batchIndex) {
-  singleMode = false;
-  currentBatchIndex = batchIndex;
-  const imgData = lastBatchData.results[batchIndex];
-  document.getElementById('annotImageName').textContent = imgData.image_name || ('Image ' + (batchIndex+1));
-
-  // load original image if provided; if not, fallback to annotated
-  const imgB64 = imgData.original_image_base64 || imgData.annotated_image_base64;
-  canvasImage = new Image();
-  canvasImage.onload = () => {
-    const maxW = 800;
-    const ratio = Math.min(maxW / canvasImage.width, 1);
-    canvasScale = ratio;
-    canvas.width = Math.round(canvasImage.width * canvasScale);
-    canvas.height = Math.round(canvasImage.height * canvasScale);
-    redrawCanvas();
-  };
-  canvasImage.src = "data:image/png;base64," + imgB64;
-
-  // populate boxes with detections (if present)
-  boxes = [];
-  const detections = imgData.detections || [];
-  detections.forEach(d => {
-    const [x1,y1,x2,y2] = d.bbox;
-    const labelName = d.label || CLASS_NAMES[0];
-    const label_id = (labelName in CLASS_NAME_TO_ID) ? CLASS_NAME_TO_ID[labelName] : 0;
-    boxes.push({ x1, y1, x2, y2, label_id });
-  });
-  selectedBoxIdx = null;
-  updateBoxList();
-  redrawCanvas();
-  bsModal.show();
-}
-
-// open modal for single image (updated to accept server detections)
-function openAnnotationModalForSingle(imageB64, imageName, detections = []) {
-  singleMode = true;
-  currentBatchIndex = null;
-  singleImageB64 = imageB64;
-  singleImageName = imageName;
-  document.getElementById('annotImageName').textContent = imageName;
-
-  canvasImage = new Image();
-  canvasImage.onload = () => {
-    const maxW = 800;
-    const ratio = Math.min(maxW / canvasImage.width, 1);
-    canvasScale = ratio;
-    canvas.width = Math.round(canvasImage.width * canvasScale);
-    canvas.height = Math.round(canvasImage.height * canvasScale);
-    redrawCanvas();
-  };
-  // imageB64 could be either raw b64 or include data: prefix — normalize:
-  const src = imageB64.startsWith('data:') ? imageB64 : ("data:image/png;base64," + imageB64);
-  canvasImage.src = src;
-
-  // populate boxes from detections if present
-  boxes = [];
-  if (Array.isArray(detections) && detections.length > 0) {
-    detections.forEach(d => {
-      if (!d.bbox) return;
-      const [x1, y1, x2, y2] = d.bbox;
-      // map label name -> id safely
-      let label_id = 0;
-      if (d.label && (d.label in CLASS_NAME_TO_ID)) label_id = CLASS_NAME_TO_ID[d.label];
-      boxes.push({ x1: Math.round(x1), y1: Math.round(y1), x2: Math.round(x2), y2: Math.round(y2), label_id });
-    });
-  } else {
-    // start empty and let user draw
-    boxes = [];
-  }
-  selectedBoxIdx = null;
-  updateBoxList();
-  redrawCanvas();
-  bsModal.show();
-}
-
-// drawing and interaction on canvas
-canvas.addEventListener('mousedown', (ev) => {
-  const r = canvas.getBoundingClientRect();
-  const x = (ev.clientX - r.left) / canvasScale;
-  const y = (ev.clientY - r.top) / canvasScale;
-  drawing = true;
-  drawStart = { x, y };
-});
-
-canvas.addEventListener('mousemove', (ev) => {
-  if (!drawing) return;
-  const r = canvas.getBoundingClientRect();
-  const x = (ev.clientX - r.left) / canvasScale;
-  const y = (ev.clientY - r.top) / canvasScale;
-  const x1 = Math.min(drawStart.x, x);
-  const y1 = Math.min(drawStart.y, y);
-  const x2 = Math.max(drawStart.x, x);
-  const y2 = Math.max(drawStart.y, y);
-  redrawCanvas();
-  ctx.strokeStyle = 'lime';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(x1*canvasScale, y1*canvasScale, (x2-x1)*canvasScale, (y2-y1)*canvasScale);
-});
-
-canvas.addEventListener('mouseup', (ev) => {
-  if (!drawing) return;
-  drawing = false;
-  const r = canvas.getBoundingClientRect();
-  const x = (ev.clientX - r.left) / canvasScale;
-  const y = (ev.clientY - r.top) / canvasScale;
-  const x1 = Math.round(Math.min(drawStart.x, x));
-  const y1 = Math.round(Math.min(drawStart.y, y));
-  const x2 = Math.round(Math.max(drawStart.x, x));
-  const y2 = Math.round(Math.max(drawStart.y, y));
-  const label_id = parseInt(labelSelect.value || 0);
-  if (Math.abs(x2-x1) > 4 && Math.abs(y2-y1) > 4) {
-    boxes.push({ x1, y1, x2, y2, label_id });
-    selectedBoxIdx = boxes.length - 1;
-  }
-  updateBoxList();
-  redrawCanvas();
-});
-
-canvas.addEventListener('click', (ev) => {
-  const r = canvas.getBoundingClientRect();
-  const x = (ev.clientX - r.left) / canvasScale;
-  const y = (ev.clientY - r.top) / canvasScale;
-  let found = null;
-  for (let i = boxes.length - 1; i >= 0; i--) {
-    const b = boxes[i];
-    if (x >= b.x1 && x <= b.x2 && y >= b.y1 && y <= b.y2) {
-      found = i;
-      break;
-    }
-  }
-  if (found !== null) {
-    selectedBoxIdx = found;
-    labelSelect.value = boxes[found].label_id;
-  } else {
-    selectedBoxIdx = null;
-  }
-  updateBoxList();
-  redrawCanvas();
-});
-
-function redrawCanvas() {
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  if (canvasImage.width) ctx.drawImage(canvasImage, 0, 0, canvas.width, canvas.height);
-
-  boxes.forEach((b, idx) => {
-    const x = b.x1*canvasScale, y = b.y1*canvasScale, w = (b.x2-b.x1)*canvasScale, h = (b.y2-b.y1)*canvasScale;
-    ctx.lineWidth = (idx === selectedBoxIdx) ? 3 : 2;
-    ctx.strokeStyle = (idx === selectedBoxIdx) ? 'red' : 'yellow';
-    ctx.strokeRect(x, y, w, h);
-    const lbl = `${b.label_id}:${CLASS_NAMES[b.label_id]||''}`;
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(x, y-18, Math.min(200, ctx.measureText(lbl).width + 8), 18);
-    ctx.fillStyle = 'white';
-    ctx.font = '14px sans-serif';
-    ctx.fillText(lbl, x + 4, y - 4);
-  });
-}
-
-/* Update the sidebar box list */
-function updateBoxList() {
-  boxListDiv.innerHTML = '';
-  boxes.forEach((b, idx) => {
-    const div = document.createElement('div');
-    div.className = 'box-item d-flex justify-content-between align-items-center';
-    const left = document.createElement('div');
-    left.innerHTML = `<strong>#${idx+1}</strong> (${b.x1},${b.y1}) — (${b.x2},${b.y2})`;
-    const right = document.createElement('div');
-    const selLabel = document.createElement('select');
-    selLabel.className = 'form-select form-select-sm';
-    selLabel.style.width = '140px';
-    CLASS_NAMES.forEach((n,i) => {
-      const o = document.createElement('option');
-      o.value = i; o.textContent = `${i}: ${n}`;
-      if (i === b.label_id) o.selected = true;
-      selLabel.appendChild(o);
-    });
-    selLabel.addEventListener('change', (ev) => {
-      b.label_id = parseInt(ev.target.value);
-      redrawCanvas();
-    });
-    const delBtn = document.createElement('button');
-    delBtn.className = 'btn btn-sm btn-outline-danger ms-2';
-    delBtn.textContent = 'Delete';
-    delBtn.addEventListener('click', () => {
-      boxes.splice(idx, 1);
-      if (selectedBoxIdx === idx) selectedBoxIdx = null;
-      updateBoxList(); redrawCanvas();
-    });
-    right.appendChild(selLabel);
-    right.appendChild(delBtn);
-    if (idx === selectedBoxIdx) div.style.background = '#fff3cd';
-    div.appendChild(left);
-    div.appendChild(right);
-    boxListDiv.appendChild(div);
-  });
-}
-
-/* Delete selected button */
-document.getElementById('deleteBoxBtn').addEventListener('click', () => {
-  if (selectedBoxIdx === null) return alert('No box selected');
-  boxes.splice(selectedBoxIdx, 1);
-  selectedBoxIdx = null;
-  updateBoxList();
-  redrawCanvas();
-});
-
-/* Cancel (close modal) */
-document.getElementById('cancelCorrectionBtn').addEventListener('click', () => {
-  bsModal.hide();
-});
-
-/* Save correction: send to backend (supports both batch + single flows) */
-document.getElementById('saveCorrectionBtn').addEventListener('click', async () => {
-  // determine mode and image context
-  let imageName, imageB64, imageW, imageH;
-  if (singleMode) {
-    if (!singleImageB64) return alert('No single image loaded');
-    imageName = singleImageName || 'single_image';
-    imageB64 = singleImageB64;
-    imageW = canvasImage.width;
-    imageH = canvasImage.height;
-  } else {
-    // safe check for batch selection
-    if (typeof currentBatchIndex !== 'number' || currentBatchIndex === null) {
-      return alert('No batch image selected');
-    }
-    if (!lastBatchData || !lastBatchData.results || !lastBatchData.results[currentBatchIndex]) {
-      return alert('No batch image data available');
-    }
-    const imgData = lastBatchData.results[currentBatchIndex];
-    imageName = imgData.image_name || `img_${currentBatchIndex}`;
-    imageB64 = (imgData.original_image_base64 || imgData.annotated_image_base64);
-    imageW = canvasImage.width;
-    imageH = canvasImage.height;
-  }
-
-  // create base64 capture from canvas for saved image
-  const dataUrl = canvas.toDataURL('image/png');
-  const savedB64 = dataUrl.split(',')[1];
-
-  const outBoxes = boxes.map(b => ({
-    x1: Math.round(b.x1),
-    y1: Math.round(b.y1),
-    x2: Math.round(b.x2),
-    y2: Math.round(b.y2),
-    label_id: Number(b.label_id)
-  }));
-
-  const payload = {
-    image_name: imageName,
-    image_b64: savedB64,
-    image_width: imageW,
-    image_height: imageH,
-    boxes: outBoxes
-  };
-
-  try {
-    const res = await fetch('/api/save_correction', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(txt || `HTTP ${res.status}`);
-    }
-    const resp = await res.json();
-    // mark corrected in UI for batch
-    if (!singleMode && lastBatchData && lastBatchData.results && lastBatchData.results[currentBatchIndex]) {
-      lastBatchData.results[currentBatchIndex].__corrected = true;
-    }
-    // If singleMode: show counts in singleResult area
-    if (singleMode) {
-      let infoHtml = '<h6>Manual counts saved</h6>';
-      if (resp.manual_result) {
-        infoHtml += `<p>Manual count: ${resp.manual_result.manual_count}</p>`;
-        if (resp.manual_result.color_counts) {
-          infoHtml += '<ul>' + Object.entries(resp.manual_result.color_counts).map(([c,v]) => `<li>${c}: ${v}</li>`).join('') + '</ul>';
+    color_counts = {}
+    if user_colors:
+        color_map = {
+            "red": (255,0,0),
+            "green": (0,255,0),
+            "blue": (0,0,255),
+            "yellow": (255,255,0),
+            "orange": (255,165,0)
         }
-        infoHtml += `<img class="img-preview mt-2" src="data:image/png;base64,${resp.manual_result.annotated_image_base64}">`;
-      }
-      document.getElementById('singleResult').innerHTML = infoHtml;
-    } else {
-      alert('Saved correction: ' + (resp.saved_label_file || 'saved'));
-    }
-    bsModal.hide();
-  } catch (err) {
-    alert('Failed to save correction: ' + err.message);
-  }
-});
+        selected_map = {c: color_map[c] for c in user_colors if c in color_map}
+        if selected_map:
+            # transform detections to the format expected by count_detections_by_color
+            dets_for_count = []
+            for d in detections:
+                dets_for_count.append({"bbox": d["bbox"]})
+            color_counts = count_detections_by_color(img_rgb, dets_for_count, selected_map)
 
-</script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
+    return {
+        "manual_count": len(detections),
+        "per_box": per_box,
+        "annotated_image_base64": annotated_b64,
+        "color_counts": color_counts
+    }
+
+# --------- Core Processing ---------
+def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_bytes: List[Tuple[str, bytes]]) -> Dict[str, Any]:
+    conf_threshold = float(params.get("confidence", 0.25))
+    detections, img_rgb = process_yolo(image_bytes, conf_threshold)
+    annotated = annotate_image_yolo(img_rgb, detections)
+    annotated_b64 = pil_to_base64(annotated)
+
+    # also include original image bytes as base64 so frontend can edit original
+    try:
+        original_pil = Image.fromarray(img_rgb)
+        original_b64 = pil_to_base64(original_pil)
+    except Exception:
+        original_b64 = annotated_b64
+
+    color_counts = {}
+    user_colors = params.get("colors")
+    if user_colors:
+        color_map = {
+            "red": (255,0,0),
+            "green": (0,255,0),
+            "blue": (0,0,255),
+            "yellow": (255,255,0),
+            "orange": (255,165,0)
+        }
+        selected_map = {c: color_map[c] for c in user_colors if c in color_map}
+        color_counts = count_detections_by_color(img_rgb, detections, selected_map)
+
+    return {
+        "detections": detections,
+        "annotated_image_base64": annotated_b64,
+        "original_image_base64": original_b64,
+        "color_counts": color_counts
+    }
+
+# --------- Filesystem helpers for supplemental data ---------
+BASE_SUPP = os.path.abspath("supplemental")
+PENDING_IMAGES = os.path.join(BASE_SUPP, "pending", "images")
+PENDING_LABELS = os.path.join(BASE_SUPP, "pending", "labels")
+TRAIN_IMAGES = os.path.join(BASE_SUPP, "train", "images")
+TRAIN_LABELS = os.path.join(BASE_SUPP, "train", "labels")
+
+def ensure_dirs():
+    for p in (PENDING_IMAGES, PENDING_LABELS, TRAIN_IMAGES, TRAIN_LABELS):
+        os.makedirs(p, exist_ok=True)
+ensure_dirs()
+
+def sanitize_filename(name: str) -> str:
+    # remove path components, spaces -> underscores, basic sanitize
+    base = os.path.basename(name)
+    base = base.replace(" ", "_")
+    return "".join(c for c in base if c.isalnum() or c in "._-").strip()
+
+def save_yolo_label_file(label_path: str, boxes: List[Dict[str, Any]], img_w: int, img_h: int):
+    """
+    Write a YOLO-format .txt: each line: class_id x_center y_center width height (normalized 0..1)
+    """
+    lines = []
+    for b in boxes:
+        cls = int(b.get("label_id", 0))
+        x1, y1, x2, y2 = b["x1"], b["y1"], b["x2"], b["y2"]
+        # clamp
+        x1 = max(0, min(img_w, x1))
+        y1 = max(0, min(img_h, y1))
+        x2 = max(0, min(img_w, x2))
+        y2 = max(0, min(img_h, y2))
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        x_center = (x1 + x2) / 2.0
+        y_center = (y1 + y2) / 2.0
+        x_center_n = x_center / img_w
+        y_center_n = y_center / img_h
+        w_n = bw / img_w
+        h_n = bh / img_h
+        lines.append(f"{cls} {x_center_n:.6f} {y_center_n:.6f} {w_n:.6f} {h_n:.6f}")
+    with open(label_path, "w") as fh:
+        fh.write("\n".join(lines))
+
+# --------- Routes ---------
+@app.route("/")
+def root():
+    # serve static/index.html from your static folder
+    return send_from_directory(app.static_folder, "index.html")
+
+@app.get("/api/classes")
+def api_classes():
+    return jsonify({"classes": CLASS_NAMES})
+
+@app.post("/api/process")
+def api_process():
+    if "image" not in request.files:
+        return jsonify({"error": "Missing image"}), 400
+
+    image_file = request.files["image"]
+    conf_threshold = request.form.get("confidence", 0.25)
+    ref_files = request.files.getlist("references")
+    references: List[Tuple[str, bytes]] = [(rf.filename, rf.read()) for rf in ref_files]
+
+    color_param = request.form.get("colors")
+    colors = []
+    if color_param:
+        try:
+            colors = list(eval(color_param)) if isinstance(color_param, str) else color_param
+        except:
+            colors = []
+
+    out = process_single_image(image_file.read(), {"confidence": conf_threshold, "colors": colors}, references)
+    return jsonify(out)
+
+@app.post("/api/batch")
+def api_batch():
+    files = request.files.getlist("images")
+    if not files:
+        return jsonify({"error": "No images uploaded"}), 400
+
+    conf_threshold = request.form.get("confidence", 0.25)
+    ref_files = request.files.getlist("references")
+    references: List[Tuple[str, bytes]] = [(rf.filename, rf.read()) for rf in ref_files]
+
+    color_param = request.form.get("colors")
+    colors = []
+    if color_param:
+        try:
+            colors = list(eval(color_param)) if isinstance(color_param, str) else color_param
+        except:
+            colors = []
+
+    rows = []
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        for f in files:
+            try:
+                image_bytes = f.read()
+                result = process_single_image(image_bytes, {"confidence": conf_threshold, "colors": colors}, references)
+                total = len(result["detections"])
+                rows.append({
+                    "image_name": sanitize_filename(f.filename),
+                    "total_features": total,
+                    "detections": result["detections"],
+                    "color_counts": result["color_counts"],
+                    "annotated_image_base64": result["annotated_image_base64"],
+                    "original_image_base64": result.get("original_image_base64")
+                })
+                img_data = base64.b64decode(result["annotated_image_base64"])
+                zf.writestr(sanitize_filename(f.filename), img_data)
+            except Exception as e:
+                rows.append({
+                    "image_name": sanitize_filename(f.filename),
+                    "error": str(e),
+                    "detections": [],
+                    "color_counts": {}
+                })
+
+    zip_buf.seek(0)
+    csv_df = pd.DataFrame(rows)
+    csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
+    csv_b64 = base64.b64encode(csv_bytes).decode("utf-8")
+    zip_b64 = base64.b64encode(zip_buf.read()).decode("utf-8")
+
+    return jsonify({
+        "results": rows,
+        "csv_base64": csv_b64,
+        "zip_base64": zip_b64
+    })
+
+@app.post("/api/count_manual")
+def api_count_manual():
+    """
+    Accepts JSON:
+    {
+      "image_b64": "...",   # base64 PNG/JPG bytes (no data: prefix)
+      "boxes": [ {"x1":..,"y1":..,"x2":..,"y2":..,"label_id":0}, ... ],
+      "colors": ["red","blue"]   # optional
+    }
+    Returns:
+      manual_count, per_box, annotated_image_base64, color_counts
+    """
+    try:
+        payload = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    if not payload:
+        return jsonify({"error": "Empty payload"}), 400
+
+    image_b64 = payload.get("image_b64")
+    boxes = payload.get("boxes", [])
+    colors = payload.get("colors", None)
+
+    if not image_b64:
+        return jsonify({"error": "Missing image_b64"}), 400
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        return jsonify({"error": "Invalid base64 image"}), 400
+
+    try:
+        resp = process_manual_boxes_from_bytes(image_bytes, boxes, user_colors=colors)
+    except Exception as e:
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+    return jsonify(resp)
+
+@app.post("/api/save_correction")
+def api_save_correction():
+    """
+    Expects JSON:
+    {
+      "image_name": "...",
+      "image_b64": "....",  # base64 PNG (no data: prefix)
+      "image_width": 1234,
+      "image_height": 987,
+      "boxes": [
+         {"x1":..,"y1":..,"x2":..,"y2":..,"label_id": 0}, ...
+      ],
+      "colors": ["red","blue"]  # optional
+    }
+    Writes:
+      supplemental/pending/images/<image_name>  (png)
+      supplemental/pending/labels/<basename>.txt (YOLO format)
+    Also returns manual counts and annotated image b64 so frontend can immediately display counts.
+    """
+    try:
+        payload = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    if not payload:
+        return jsonify({"error": "Empty payload"}), 400
+
+    image_name = sanitize_filename(payload.get("image_name", "unnamed.png"))
+    image_b64 = payload.get("image_b64")
+    image_width = int(payload.get("image_width", 0))
+    image_height = int(payload.get("image_height", 0))
+    boxes = payload.get("boxes", [])
+    colors = payload.get("colors", None)
+
+    if not image_b64:
+        return jsonify({"error": "Missing image_b64"}), 400
+
+    # ensure extension .png if not present
+    if not os.path.splitext(image_name)[1]:
+        image_name = image_name + ".png"
+    elif os.path.splitext(image_name)[1].lower() not in ('.png', '.jpg', '.jpeg'):
+        # force png extension for saved image
+        image_name = os.path.splitext(image_name)[0] + ".png"
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        return jsonify({"error": "Invalid base64 image"}), 400
+
+    image_path = os.path.join(PENDING_IMAGES, image_name)
+    with open(image_path, "wb") as fh:
+        fh.write(image_bytes)
+
+    # YOLO label path
+    label_basename = os.path.splitext(image_name)[0] + ".txt"
+    label_path = os.path.join(PENDING_LABELS, label_basename)
+    try:
+        if image_width <= 0 or image_height <= 0:
+            # try to infer dims from saved image
+            img = Image.open(io.BytesIO(image_bytes))
+            image_width, image_height = img.size
+
+        save_yolo_label_file(label_path, boxes, image_width, image_height)
+    except Exception as e:
+        return jsonify({"error": f"Failed to save labels: {str(e)}"}), 500
+
+    # Also compute manual counts and annotated image for immediate frontend feedback
+    try:
+        manual_resp = process_manual_boxes_from_bytes(image_bytes, boxes, user_colors=colors)
+    except Exception as e:
+        manual_resp = {"error": f"Failed to compute manual counts: {str(e)}"}
+
+    return jsonify({
+        "saved_image": image_path,
+        "saved_label_file": label_path,
+        "manual_result": manual_resp
+    })
+
+@app.post("/api/finalize_supplemental")
+def api_finalize_supplemental():
+    """
+    Move files from supplemental/pending -> supplemental/train
+    """
+    moved = 0
+    # images
+    for src_dir, dst_dir in [(PENDING_IMAGES, TRAIN_IMAGES), (PENDING_LABELS, TRAIN_LABELS)]:
+        for fname in os.listdir(src_dir):
+            src = os.path.join(src_dir, fname)
+            dst = os.path.join(dst_dir, fname)
+            try:
+                shutil.move(src, dst)
+                moved += 1
+            except Exception as e:
+                app.logger.exception(f"Could not move {src} -> {dst}: {e}")
+    return jsonify({"moved": moved})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port, debug=True)
