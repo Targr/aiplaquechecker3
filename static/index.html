@@ -25,7 +25,7 @@
 <div class="container mt-4">
   <h1 class="text-center mb-4">Plaque / Colony AI Counter — Review Mode</h1>
 
-  <!-- Single Image Processing (unchanged other than original image b64 returned) -->
+  <!-- Single Image Processing -->
   <div class="card mb-4">
     <div class="card-body">
       <h5>Single Image Processing</h5>
@@ -229,7 +229,7 @@ function renderResults(data, resultDiv) {
 }
 
 /* -----------------------
-   Single image handler (modified to open annotation modal when requested)
+   Single image handler (modified to call /api/process even for multi-plate)
    ----------------------- */
 let singleMode = false;
 let singleImageB64 = null;
@@ -242,46 +242,67 @@ document.getElementById('singleForm').addEventListener('submit', async (e) => {
   const colors = JSON.stringify(getSelectedColors(form));
   const conf = document.getElementById('singleConfidence').value;
 
-  // if Multi-Plate checkbox is checked, open the annotation modal for drawing
-  if (multiPlate) {
-    // read the uploaded image as base64 and open modal
-    const fileInput = form.querySelector('input[type="file"][name="image"]');
-    if (!fileInput.files || fileInput.files.length === 0) {
-      document.getElementById('singleResult').innerHTML = '<div class="text-danger">No image chosen</div>';
-      return;
+  // Build a FormData to call /api/process in all cases (so user gets model detections)
+  const fileInput = form.querySelector('input[type="file"][name="image"]');
+  if (!fileInput.files || fileInput.files.length === 0) {
+    document.getElementById('singleResult').innerHTML = '<div class="text-danger">No image chosen</div>';
+    return;
+  }
+  const file = fileInput.files[0];
+
+  // If not multi-plate simply call process and render results (existing behavior)
+  if (!multiPlate) {
+    const formData = new FormData(form);
+    formData.set("confidence", conf);
+    formData.set("colors", colors);
+    formData.set("multi_plate", "false");
+
+    const resultDiv = document.getElementById('singleResult');
+    resultDiv.innerHTML = 'Processing...';
+    try {
+      const data = await postFormData('/api/process', formData);
+      renderResults(data, resultDiv);
+    } catch (err) {
+      resultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
     }
-    const file = fileInput.files[0];
-    const reader = new FileReader();
-    reader.onload = function(ev) {
-      const dataUrl = ev.target.result; // "data:image/png;base64,...."
-      const b64 = dataUrl.split(',')[1];
-      singleMode = true;
-      singleImageB64 = b64;
-      singleImageName = file.name || ('image_single');
-      openAnnotationModalForSingle(b64, singleImageName);
-    };
-    reader.readAsDataURL(file);
     return;
   }
 
-  // otherwise normal process call
-  const formData = new FormData(form);
-  formData.append("confidence", conf);
-  formData.append("colors", colors);
-  formData.append("multi_plate", multiPlate);
-
-  const resultDiv = document.getElementById('singleResult');
-  resultDiv.innerHTML = 'Processing...';
+  // MULTI-PLATE case: call server to get detections then open modal with detections preloaded
   try {
-    const data = await postFormData('/api/process', formData);
-    renderResults(data, resultDiv);
+    const formData = new FormData();
+    formData.append('image', file);
+    formData.append('confidence', conf);
+    formData.append('colors', colors);
+    formData.append('multi_plate', 'true');
+
+    const resultDiv = document.getElementById('singleResult');
+    resultDiv.innerHTML = 'Processing (getting detections)...';
+
+    const resp = await postFormData('/api/process', formData);
+    // resp should include detections and original_image_base64
+    const imgB64 = resp.original_image_base64 || resp.annotated_image_base64;
+    const detections = resp.detections || [];
+
+    // save single-mode state
+    singleMode = true;
+    // normalize: if resp returns "data:image/..." prefix, strip it
+    singleImageB64 = imgB64.startsWith('data:') ? imgB64.split(',')[1] : imgB64;
+    singleImageName = file.name || 'single_image';
+
+    // open modal prepopulated with detections
+    openAnnotationModalForSingle(singleImageB64, singleImageName, detections);
+
+    // show a compact summary in singleResult
+    resultDiv.innerHTML = `<div class="text-success">Detections loaded into editor (${detections.length}). Draw additional boxes if needed, then Save.</div>`;
+
   } catch (err) {
-    resultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
+    document.getElementById('singleResult').innerHTML = `<div class="text-danger">Error getting detections: ${err.message}</div>`;
   }
 });
 
 /* -----------------------
-   Batch processing + review UI (unchanged)
+   Batch processing + review UI
    ----------------------- */
 let lastBatchData = null; // store response so review can access it
 document.getElementById('batchForm').addEventListener('submit', async (e) => {
@@ -426,8 +447,8 @@ function openAnnotationModal(batchIndex) {
   bsModal.show();
 }
 
-// open modal for single image (new)
-function openAnnotationModalForSingle(imageB64, imageName) {
+// open modal for single image (updated to accept server detections)
+function openAnnotationModalForSingle(imageB64, imageName, detections = []) {
   singleMode = true;
   currentBatchIndex = null;
   singleImageB64 = imageB64;
@@ -443,10 +464,25 @@ function openAnnotationModalForSingle(imageB64, imageName) {
     canvas.height = Math.round(canvasImage.height * canvasScale);
     redrawCanvas();
   };
-  canvasImage.src = "data:image/png;base64," + imageB64;
+  // imageB64 could be either raw b64 or include data: prefix — normalize:
+  const src = imageB64.startsWith('data:') ? imageB64 : ("data:image/png;base64," + imageB64);
+  canvasImage.src = src;
 
-  // start with no boxes (user will draw them)
+  // populate boxes from detections if present
   boxes = [];
+  if (Array.isArray(detections) && detections.length > 0) {
+    detections.forEach(d => {
+      if (!d.bbox) return;
+      const [x1, y1, x2, y2] = d.bbox;
+      // map label name -> id safely
+      let label_id = 0;
+      if (d.label && (d.label in CLASS_NAME_TO_ID)) label_id = CLASS_NAME_TO_ID[d.label];
+      boxes.push({ x1: Math.round(x1), y1: Math.round(y1), x2: Math.round(x2), y2: Math.round(y2), label_id });
+    });
+  } else {
+    // start empty and let user draw
+    boxes = [];
+  }
   selectedBoxIdx = null;
   updateBoxList();
   redrawCanvas();
@@ -589,9 +625,7 @@ document.getElementById('cancelCorrectionBtn').addEventListener('click', () => {
   bsModal.hide();
 });
 
-/* Save correction: send to backend
-   Now supports both batch + single flows
-*/
+/* Save correction: send to backend (supports both batch + single flows) */
 document.getElementById('saveCorrectionBtn').addEventListener('click', async () => {
   // determine mode and image context
   let imageName, imageB64, imageW, imageH;
@@ -603,12 +637,10 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
     imageH = canvasImage.height;
   } else {
     if (!lastBatchData || (currentBatchIndex !== 0 && !currentBatchIndex)) {
-      // allow zero index
       if (currentBatchIndex !== 0 && !currentBatchIndex) return alert('No batch image selected');
     }
     const imgData = lastBatchData.results[currentBatchIndex];
     imageName = imgData.image_name || `img_${currentBatchIndex}`;
-    // prefer original image if available to save highest fidelity
     imageB64 = (imgData.original_image_base64 || imgData.annotated_image_base64);
     imageW = canvasImage.width;
     imageH = canvasImage.height;
@@ -661,11 +693,6 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
       }
       document.getElementById('singleResult').innerHTML = infoHtml;
     } else {
-      // re-render batch viewer so corrected badge appears
-      const evt = new Event('submit');
-      // re-render current batch UI by reusing lastBatchData (no fresh server call)
-      document.getElementById('batchForm').dispatchEvent(evt);
-      // But to avoid re-submitting form, simply close modal and notify user
       alert('Saved correction: ' + (resp.saved_label_file || 'saved'));
     }
     bsModal.hide();
