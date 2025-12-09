@@ -25,14 +25,14 @@
 <div class="container mt-4">
   <h1 class="text-center mb-4">Plaque / Colony AI Counter — Review Mode</h1>
 
-  <!-- Single Image Processing (unchanged other than original image b64 returned) -->
+  <!-- Single Image Processing (unchanged other than annotated review flow) -->
   <div class="card mb-4">
     <div class="card-body">
       <h5>Single Image Processing</h5>
       <form id="singleForm">
         <div class="mb-2">
           <label class="form-label">Upload Image or Take Photo</label>
-          <input class="form-control" type="file" name="image" required accept="image/*" capture="environment">
+          <input class="form-control" id="singleImageInput" type="file" name="image" required accept="image/*" capture="environment">
         </div>
         <div class="mb-2">
           <label class="form-label">Reference Images (Optional)</label>
@@ -229,27 +229,57 @@ function renderResults(data, resultDiv) {
 }
 
 /* -----------------------
-   Single image handler (unchanged)
+   Single image handler (modified: if "Multiple Plates" checked -> open annotation modal instead of direct process)
    ----------------------- */
-document.getElementById('singleForm').addEventListener('submit', async (e) => {
+const singleForm = document.getElementById('singleForm');
+const singleImageInput = document.getElementById('singleImageInput');
+let singleReviewMode = false;
+let singleImageB64 = '';
+let singleImageName = '';
+let singleResultDiv = document.getElementById('singleResult');
+let singleSelectedColors = [];
+
+singleForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const formData = new FormData(e.target);
+  const multiPlate = document.getElementById("multiPlateSingle").checked;
   formData.append("confidence", document.getElementById('singleConfidence').value);
   formData.append("colors", JSON.stringify(getSelectedColors(e.target)));
-  formData.append("multi_plate", document.getElementById("multiPlateSingle").checked);
+  formData.append("multi_plate", multiPlate);
 
-  const resultDiv = document.getElementById('singleResult');
-  resultDiv.innerHTML = 'Processing...';
-  try {
-    const data = await postFormData('/api/process', formData);
-    renderResults(data, resultDiv);
-  } catch (err) {
-    resultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
+  if (!multiPlate) {
+    // existing behaviour: send to /api/process
+    singleResultDiv.innerHTML = 'Processing...';
+    try {
+      const data = await postFormData('/api/process', formData);
+      renderResults(data, singleResultDiv);
+    } catch (err) {
+      singleResultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
+    }
+    return;
   }
+
+  // If multiPlate is checked: open annotation modal for user to draw boxes
+  const fileInput = singleImageInput.files[0];
+  if (!fileInput) {
+    singleResultDiv.innerHTML = `<div class="text-danger">Please choose an image first.</div>`;
+    return;
+  }
+  singleImageName = fileInput.name || 'single_image';
+  singleSelectedColors = getSelectedColors(singleForm);
+
+  // read as dataURL
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    const dataUrl = ev.target.result; // "data:image/png;base64,...."
+    singleImageB64 = dataUrl.split(',')[1];
+    openAnnotationModalForSingle(singleImageB64, singleImageName);
+  };
+  reader.readAsDataURL(fileInput);
 });
 
 /* -----------------------
-   Batch processing + review UI
+   Batch processing + review UI (unchanged)
    ----------------------- */
 let lastBatchData = null; // store response so review can access it
 document.getElementById('batchForm').addEventListener('submit', async (e) => {
@@ -331,7 +361,7 @@ document.getElementById('batchForm').addEventListener('submit', async (e) => {
 });
 
 /* -----------------------
-   Annotation modal logic
+   Annotation modal logic (shared)
    ----------------------- */
 const annotModalEl = document.getElementById('annotModal');
 const bsModal = new bootstrap.Modal(annotModalEl, { backdrop: 'static', keyboard: false });
@@ -359,7 +389,7 @@ function populateLabelSelect() {
 }
 populateLabelSelect();
 
-// open modal for given batch index
+// open modal for given batch index (existing)
 function openAnnotationModal(batchIndex) {
   if (!lastBatchData) return;
   currentBatchIndex = batchIndex;
@@ -384,13 +414,37 @@ function openAnnotationModal(batchIndex) {
   boxes = [];
   const detections = imgData.detections || [];
   detections.forEach(d => {
-    // d.bbox = [x1,y1,x2,y2]
     const [x1,y1,x2,y2] = d.bbox;
     const labelName = d.label || CLASS_NAMES[0];
     const label_id = (labelName in CLASS_NAME_TO_ID) ? CLASS_NAME_TO_ID[labelName] : 0;
     boxes.push({ x1, y1, x2, y2, label_id });
   });
   selectedBoxIdx = null;
+  singleReviewMode = false; // ensure batch mode
+  updateBoxList();
+  redrawCanvas();
+  bsModal.show();
+}
+
+// open modal for single-image review
+function openAnnotationModalForSingle(imageB64NoPrefix, imageName) {
+  currentBatchIndex = null;
+  document.getElementById('annotImageName').textContent = imageName || 'Single Image';
+  canvasImage = new Image();
+  canvasImage.onload = () => {
+    const maxW = 800;
+    const ratio = Math.min(maxW / canvasImage.width, 1);
+    canvasScale = ratio;
+    canvas.width = Math.round(canvasImage.width * canvasScale);
+    canvas.height = Math.round(canvasImage.height * canvasScale);
+    redrawCanvas();
+  };
+  canvasImage.src = "data:image/png;base64," + imageB64NoPrefix;
+
+  // start with no boxes (user will draw)
+  boxes = [];
+  selectedBoxIdx = null;
+  singleReviewMode = true;
   updateBoxList();
   redrawCanvas();
   bsModal.show();
@@ -540,17 +594,12 @@ document.getElementById('cancelCorrectionBtn').addEventListener('click', () => {
   bsModal.hide();
 });
 
-/* Save correction: send to backend */
+/* Save correction: sends to /api/count_manual if singleReviewMode, else /api/save_correction (existing) */
 document.getElementById('saveCorrectionBtn').addEventListener('click', async () => {
-  if (!currentBatchIndex && currentBatchIndex !== 0) return;
-  // prepare payload
-  // capture current canvas as image bytes (base64)
+  // prepare image bytes and boxes
   const dataUrl = canvas.toDataURL('image/png');
   const b64 = dataUrl.split(',')[1]; // base64 content
-  // prepare boxes in absolute pixel coordinates relative to original image dimensions
   const imgW = canvasImage.width, imgH = canvasImage.height;
-  // boxes currently in absolute pixel coords (since we used canvasScale earlier to convert)
-  // ensure integer ints
   const outBoxes = boxes.map(b => ({
     x1: Math.round(b.x1),
     y1: Math.round(b.y1),
@@ -558,7 +607,51 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
     y2: Math.round(b.y2),
     label_id: Number(b.label_id)
   }));
-  const payload = {
+
+  if (singleReviewMode) {
+    // call /api/count_manual and show results in singleResultDiv
+    const payload = {
+      image_b64: b64,
+      boxes: outBoxes,
+      colors: singleSelectedColors.length ? singleSelectedColors : undefined
+    };
+    try {
+      const res = await fetch('/api/count_manual', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || `HTTP ${res.status}`);
+      }
+      const resp = await res.json();
+      // Display manual count and annotated image
+      let html = `<h5>Manual Count Result</h5>`;
+      html += `<p><strong>Total plates marked:</strong> ${resp.manual_count}</p>`;
+      if (resp.annotated_image_base64) {
+        html += `<img class="img-preview" src="data:image/png;base64,${resp.annotated_image_base64}">`;
+      }
+      if (resp.color_counts) {
+        html += '<h6>Color counts</h6><ul>' + Object.entries(resp.color_counts).map(([c,v]) => `<li>${c}: ${v}</li>`).join('') + '</ul>';
+      }
+      if (resp.per_box) {
+        html += `<details><summary>Per-box metadata (${resp.per_box.length})</summary><pre>${JSON.stringify(resp.per_box, null, 2)}</pre></details>`;
+      }
+      singleResultDiv.innerHTML = html;
+      bsModal.hide();
+      singleReviewMode = false;
+    } catch (err) {
+      alert('Failed to submit manual count: ' + err.message);
+    }
+    return;
+  }
+
+  // Otherwise: batch/save behavior (keep original behavior)
+  if (currentBatchIndex === null && currentBatchIndex !== 0) {
+    return alert('No batch index in context');
+  }
+  const payloadSave = {
     image_name: lastBatchData.results[currentBatchIndex].image_name || `img_${currentBatchIndex}`,
     image_b64: b64,
     image_width: imgW,
@@ -569,7 +662,7 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
     const res = await fetch('/api/save_correction', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payloadSave)
     });
     if (!res.ok) {
       const txt = await res.text();
