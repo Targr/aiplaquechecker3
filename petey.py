@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import io
 import os
 import base64
@@ -31,13 +32,40 @@ def pil_to_base64(pil_img: Image.Image, fmt: str = "PNG") -> str:
     pil_img.save(buf, format=fmt)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+def numpy_to_pil(img_rgb: np.ndarray) -> Image.Image:
+    return Image.fromarray(img_rgb)
+
+def base64_to_numpy_image(b64_str: str) -> np.ndarray:
+    # accepts raw base64 PNG/JPG bytes (no data: prefix)
+    img_bytes = base64.b64decode(b64_str)
+    arr = np.asarray(bytearray(img_bytes), dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("Failed to decode image bytes")
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return img_rgb
+
 def annotate_image_yolo(img: np.ndarray, detections: List[Dict[str, Any]]) -> Image.Image:
     pil = Image.fromarray(img)
     draw = ImageDraw.Draw(pil)
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
         draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=3)
-        draw.text((x1, max(0, y1 - 10)), f"{det['label']} {det['confidence']:.2f}", fill=(255, 255, 0))
+        draw.text((x1, max(0, y1 - 10)), f"{det.get('label','') } {det.get('confidence',0):.2f}", fill=(255, 255, 0))
+    return pil
+
+def annotate_image_with_boxes(img: np.ndarray, boxes: List[Dict[str, Any]]) -> Image.Image:
+    # boxes are dicts with x1,y1,x2,y2 and optional label/confidence
+    pil = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    for b in boxes:
+        x1, y1, x2, y2 = int(b["x1"]), int(b["y1"]), int(b["x2"]), int(b["y2"])
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
+        label = b.get("label", "")
+        conf = b.get("confidence")
+        text = f"{label} {conf:.2f}" if conf is not None else label
+        if text.strip():
+            draw.text((x1, max(0, y1 - 10)), text, fill=(255, 255, 0))
     return pil
 
 def process_yolo(image_bytes: bytes, conf_threshold: float) -> Tuple[List[Dict[str, Any]], np.ndarray]:
@@ -92,13 +120,79 @@ def count_detections_by_color(img_rgb: np.ndarray, detections: List[Dict[str, An
     counts = Counter({color: 0 for color in color_map.keys()})
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
-        crop = img_rgb[y1:y2, x1:x2]
+        # clamp
+        h, w = img_rgb.shape[:2]
+        x1c, y1c, x2c, y2c = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        crop = img_rgb[y1c:y2c, x1c:x2c]
         if crop.size == 0:
             continue
         mean_color = crop.mean(axis=(0,1))
         closest_color = min(color_map.keys(), key=lambda c: np.linalg.norm(np.array(color_map[c]) - mean_color))
         counts[closest_color] += 1
     return dict(counts)
+
+# --------- Manual box processing helper ---------
+def process_manual_boxes_from_bytes(image_bytes: bytes, boxes: List[Dict[str, Any]], user_colors: List[str]=None) -> Dict[str, Any]:
+    """
+    boxes: list of dicts with keys x1,y1,x2,y2 and optional label_id/label
+    returns counts, annotated image b64, per-box metadata, and color counts if requested
+    """
+    arr = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return {"error": "Could not decode image"}
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    per_box = []
+    detections = []
+    h, w = img_rgb.shape[:2]
+    for b in boxes:
+        x1 = int(max(0, min(w, b.get("x1", 0))))
+        y1 = int(max(0, min(h, b.get("y1", 0))))
+        x2 = int(max(0, min(w, b.get("x2", x1+1))))
+        y2 = int(max(0, min(h, b.get("y2", y1+1))))
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        area = width * height
+        label_id = b.get("label_id")
+        label = b.get("label") if b.get("label") else (CLASS_NAMES[label_id] if label_id is not None and label_id < len(CLASS_NAMES) else "")
+        det = {
+            "bbox": [x1, y1, x2, y2],
+            "width": width,
+            "height": height,
+            "area": area,
+            "label": label,
+            "label_id": label_id
+        }
+        detections.append(det)
+        per_box.append(det)
+
+    annotated_pil = annotate_image_with_boxes(img_rgb, [{"x1":d["bbox"][0],"y1":d["bbox"][1],"x2":d["bbox"][2],"y2":d["bbox"][3],"label":d.get("label","")} for d in detections])
+    annotated_b64 = pil_to_base64(annotated_pil)
+
+    color_counts = {}
+    if user_colors:
+        color_map = {
+            "red": (255,0,0),
+            "green": (0,255,0),
+            "blue": (0,0,255),
+            "yellow": (255,255,0),
+            "orange": (255,165,0)
+        }
+        selected_map = {c: color_map[c] for c in user_colors if c in color_map}
+        if selected_map:
+            # transform detections to the format expected by count_detections_by_color
+            dets_for_count = []
+            for d in detections:
+                dets_for_count.append({"bbox": d["bbox"]})
+            color_counts = count_detections_by_color(img_rgb, dets_for_count, selected_map)
+
+    return {
+        "manual_count": len(detections),
+        "per_box": per_box,
+        "annotated_image_base64": annotated_b64,
+        "color_counts": color_counts
+    }
 
 # --------- Core Processing ---------
 def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_bytes: List[Tuple[str, bytes]]) -> Dict[str, Any]:
@@ -264,6 +358,45 @@ def api_batch():
         "zip_base64": zip_b64
     })
 
+@app.post("/api/count_manual")
+def api_count_manual():
+    """
+    Accepts JSON:
+    {
+      "image_b64": "...",   # base64 PNG/JPG bytes (no data: prefix)
+      "boxes": [ {"x1":..,"y1":..,"x2":..,"y2":..,"label_id":0}, ... ],
+      "colors": ["red","blue"]   # optional
+    }
+    Returns:
+      manual_count, per_box, annotated_image_base64, color_counts
+    """
+    try:
+        payload = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    if not payload:
+        return jsonify({"error": "Empty payload"}), 400
+
+    image_b64 = payload.get("image_b64")
+    boxes = payload.get("boxes", [])
+    colors = payload.get("colors", None)
+
+    if not image_b64:
+        return jsonify({"error": "Missing image_b64"}), 400
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        return jsonify({"error": "Invalid base64 image"}), 400
+
+    try:
+        resp = process_manual_boxes_from_bytes(image_bytes, boxes, user_colors=colors)
+    except Exception as e:
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+    return jsonify(resp)
+
 @app.post("/api/save_correction")
 def api_save_correction():
     """
@@ -275,11 +408,13 @@ def api_save_correction():
       "image_height": 987,
       "boxes": [
          {"x1":..,"y1":..,"x2":..,"y2":..,"label_id": 0}, ...
-      ]
+      ],
+      "colors": ["red","blue"]  # optional
     }
     Writes:
       supplemental/pending/images/<image_name>  (png)
       supplemental/pending/labels/<basename>.txt (YOLO format)
+    Also returns manual counts and annotated image b64 so frontend can immediately display counts.
     """
     try:
         payload = request.get_json(force=True)
@@ -294,6 +429,7 @@ def api_save_correction():
     image_width = int(payload.get("image_width", 0))
     image_height = int(payload.get("image_height", 0))
     boxes = payload.get("boxes", [])
+    colors = payload.get("colors", None)
 
     if not image_b64:
         return jsonify({"error": "Missing image_b64"}), 400
@@ -305,7 +441,11 @@ def api_save_correction():
         # force png extension for saved image
         image_name = os.path.splitext(image_name)[0] + ".png"
 
-    image_bytes = base64.b64decode(image_b64)
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        return jsonify({"error": "Invalid base64 image"}), 400
+
     image_path = os.path.join(PENDING_IMAGES, image_name)
     with open(image_path, "wb") as fh:
         fh.write(image_bytes)
@@ -323,7 +463,17 @@ def api_save_correction():
     except Exception as e:
         return jsonify({"error": f"Failed to save labels: {str(e)}"}), 500
 
-    return jsonify({"saved_image": image_path, "saved_label_file": label_path})
+    # Also compute manual counts and annotated image for immediate frontend feedback
+    try:
+        manual_resp = process_manual_boxes_from_bytes(image_bytes, boxes, user_colors=colors)
+    except Exception as e:
+        manual_resp = {"error": f"Failed to compute manual counts: {str(e)}"}
+
+    return jsonify({
+        "saved_image": image_path,
+        "saved_label_file": label_path,
+        "manual_result": manual_resp
+    })
 
 @app.post("/api/finalize_supplemental")
 def api_finalize_supplemental():
