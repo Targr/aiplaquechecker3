@@ -1,9 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="UTF-8">
   <title>Plaque/Colony AI Counter (with Review)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     body { background: #f8f9fa; padding-bottom: 40px; }
@@ -229,21 +229,42 @@ function renderResults(data, resultDiv) {
 }
 
 /* -----------------------
-   Single image handler (modified to call /api/process even for multi-plate)
+   Globals (hoisted) to avoid TDZ issues
    ----------------------- */
 let singleMode = false;
 let singleImageB64 = null;
 let singleImageName = null;
-
-/* Move declaration of currentBatchIndex up so it's available to handlers */
 let currentBatchIndex = null; // integer when batch mode; null in singleMode
 
-/* HOISTED VARS: canvasImage, canvasScale, boxes, selectedBoxIdx */
+// hoisted vars that previously caused TDZ errors
 var canvasImage = new Image();
 var canvasScale = 1;
 var boxes = []; // {x1,y1,x2,y2,label_id}
 var selectedBoxIdx = null;
 
+// hoist DOM references now (elements are present because script is after HTML)
+var boxListDiv = document.getElementById('boxList');
+var labelSelect = document.getElementById('labelSelect');
+
+/* -----------------------
+   Setup label select
+   ----------------------- */
+function populateLabelSelect() {
+  if (!labelSelect) return;
+  labelSelect.innerHTML = '';
+  CLASS_NAMES.forEach((n,idx) => {
+    const opt = document.createElement('option');
+    opt.value = idx;
+    opt.textContent = `${idx}: ${n}`;
+    labelSelect.appendChild(opt);
+  });
+}
+// call populate after small delay to allow CLASS_NAMES to fill (loadClasses is async)
+setTimeout(populateLabelSelect, 200);
+
+/* -----------------------
+   Single image handler (modified to call /api/process even for multi-plate)
+   ----------------------- */
 document.getElementById('singleForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -251,7 +272,6 @@ document.getElementById('singleForm').addEventListener('submit', async (e) => {
   const colors = JSON.stringify(getSelectedColors(form));
   const conf = document.getElementById('singleConfidence').value;
 
-  // Build a FormData to call /api/process in all cases (so user gets model detections)
   const fileInput = form.querySelector('input[type="file"][name="image"]');
   if (!fileInput.files || fileInput.files.length === 0) {
     document.getElementById('singleResult').innerHTML = '<div class="text-danger">No image chosen</div>';
@@ -259,7 +279,6 @@ document.getElementById('singleForm').addEventListener('submit', async (e) => {
   }
   const file = fileInput.files[0];
 
-  // If not multi-plate simply call process and render results (existing behavior)
   if (!multiPlate) {
     const formData = new FormData(form);
     formData.set("confidence", conf);
@@ -277,7 +296,6 @@ document.getElementById('singleForm').addEventListener('submit', async (e) => {
     return;
   }
 
-  // MULTI-PLATE case: call server to get detections then open modal with detections preloaded
   try {
     const formData = new FormData();
     formData.append('image', file);
@@ -289,19 +307,15 @@ document.getElementById('singleForm').addEventListener('submit', async (e) => {
     resultDiv.innerHTML = 'Processing (getting detections)...';
 
     const resp = await postFormData('/api/process', formData);
-    // resp should include detections and original_image_base64
     const imgB64 = resp.original_image_base64 || resp.annotated_image_base64;
     const detections = resp.detections || [];
 
-    // save single-mode state
     singleMode = true;
     singleImageB64 = imgB64.startsWith('data:') ? imgB64.split(',')[1] : imgB64;
     singleImageName = file.name || 'single_image';
 
-    // open modal prepopulated with detections
     openAnnotationModalForSingle(singleImageB64, singleImageName, detections);
 
-    // show a compact summary in singleResult
     resultDiv.innerHTML = `<div class="text-success">Detections loaded into editor (${detections.length}). Draw additional boxes if needed, then Save.</div>`;
 
   } catch (err) {
@@ -352,7 +366,6 @@ document.getElementById('batchForm').addEventListener('submit', async (e) => {
         </div>
       `;
       resultDiv.innerHTML = html;
-      // info block
       let infoHtml = `<details><summary>Detections (${imgData.total_features || (imgData.detections||[]).length})</summary>
                        <pre>${JSON.stringify(imgData.detections || [], null, 2)}</pre></details>`;
       if (imgData.color_counts) {
@@ -401,28 +414,28 @@ const canvas = document.getElementById('annotCanvas');
 const ctx = canvas.getContext('2d');
 let drawing = false;
 let drawStart = null;
-const boxListDiv = document.getElementById('boxList');
-const labelSelect = document.getElementById('labelSelect');
 
-function populateLabelSelect() {
-  labelSelect.innerHTML = '';
-  CLASS_NAMES.forEach((n,idx) => {
-    const opt = document.createElement('option');
-    opt.value = idx;
-    opt.textContent = `${idx}: ${n}`;
-    labelSelect.appendChild(opt);
-  });
+function populateLabelSelectOnLoad() {
+  // ensure options reflect CLASS_NAMES once loaded
+  if (labelSelect) {
+    labelSelect.innerHTML = '';
+    CLASS_NAMES.forEach((n, idx) => {
+      const opt = document.createElement('option');
+      opt.value = idx;
+      opt.textContent = `${idx}: ${n}`;
+      labelSelect.appendChild(opt);
+    });
+  }
 }
-populateLabelSelect();
+setTimeout(populateLabelSelectOnLoad, 300);
 
-// open modal for given batch index (existing function)
+// open modal for given batch index
 function openAnnotationModal(batchIndex) {
   singleMode = false;
   currentBatchIndex = batchIndex;
   const imgData = lastBatchData.results[batchIndex];
   document.getElementById('annotImageName').textContent = imgData.image_name || ('Image ' + (batchIndex+1));
 
-  // load original image if provided; if not, fallback to annotated
   const imgB64 = imgData.original_image_base64 || imgData.annotated_image_base64;
   canvasImage = new Image();
   canvasImage.onload = () => {
@@ -435,7 +448,6 @@ function openAnnotationModal(batchIndex) {
   };
   canvasImage.src = "data:image/png;base64," + imgB64;
 
-  // populate boxes with detections (if present)
   boxes = [];
   const detections = imgData.detections || [];
   detections.forEach(d => {
@@ -450,7 +462,7 @@ function openAnnotationModal(batchIndex) {
   bsModal.show();
 }
 
-// open modal for single image (updated to accept server detections)
+// open modal for single image (server detections)
 function openAnnotationModalForSingle(imageB64, imageName, detections = []) {
   singleMode = true;
   currentBatchIndex = null;
@@ -467,24 +479,18 @@ function openAnnotationModalForSingle(imageB64, imageName, detections = []) {
     canvas.height = Math.round(canvasImage.height * canvasScale);
     redrawCanvas();
   };
-  // imageB64 could be either raw b64 or include data: prefix — normalize:
   const src = imageB64.startsWith('data:') ? imageB64 : ("data:image/png;base64," + imageB64);
   canvasImage.src = src;
 
-  // populate boxes from detections if present
   boxes = [];
   if (Array.isArray(detections) && detections.length > 0) {
     detections.forEach(d => {
       if (!d.bbox) return;
       const [x1, y1, x2, y2] = d.bbox;
-      // map label name -> id safely
       let label_id = 0;
       if (d.label && (d.label in CLASS_NAME_TO_ID)) label_id = CLASS_NAME_TO_ID[d.label];
       boxes.push({ x1: Math.round(x1), y1: Math.round(y1), x2: Math.round(x2), y2: Math.round(y2), label_id });
     });
-  } else {
-    // start empty and let user draw
-    boxes = [];
   }
   selectedBoxIdx = null;
   updateBoxList();
@@ -526,7 +532,7 @@ canvas.addEventListener('mouseup', (ev) => {
   const y1 = Math.round(Math.min(drawStart.y, y));
   const x2 = Math.round(Math.max(drawStart.x, x));
   const y2 = Math.round(Math.max(drawStart.y, y));
-  const label_id = parseInt(labelSelect.value || 0);
+  const label_id = parseInt((labelSelect && labelSelect.value) || 0);
   if (Math.abs(x2-x1) > 4 && Math.abs(y2-y1) > 4) {
     boxes.push({ x1, y1, x2, y2, label_id });
     selectedBoxIdx = boxes.length - 1;
@@ -549,7 +555,7 @@ canvas.addEventListener('click', (ev) => {
   }
   if (found !== null) {
     selectedBoxIdx = found;
-    labelSelect.value = boxes[found].label_id;
+    if (labelSelect) labelSelect.value = boxes[found].label_id;
   } else {
     selectedBoxIdx = null;
   }
@@ -577,6 +583,7 @@ function redrawCanvas() {
 
 /* Update the sidebar box list */
 function updateBoxList() {
+  if (!boxListDiv) return;
   boxListDiv.innerHTML = '';
   boxes.forEach((b, idx) => {
     const div = document.createElement('div');
@@ -630,7 +637,6 @@ document.getElementById('cancelCorrectionBtn').addEventListener('click', () => {
 
 /* Save correction: send to backend (supports both batch + single flows) */
 document.getElementById('saveCorrectionBtn').addEventListener('click', async () => {
-  // determine mode and image context
   let imageName, imageB64, imageW, imageH;
   if (singleMode) {
     if (!singleImageB64) return alert('No single image loaded');
@@ -639,7 +645,6 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
     imageW = canvasImage.width;
     imageH = canvasImage.height;
   } else {
-    // safe check for batch selection
     if (typeof currentBatchIndex !== 'number' || currentBatchIndex === null) {
       return alert('No batch image selected');
     }
@@ -653,7 +658,6 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
     imageH = canvasImage.height;
   }
 
-  // create base64 capture from canvas for saved image
   const dataUrl = canvas.toDataURL('image/png');
   const savedB64 = dataUrl.split(',')[1];
 
@@ -684,11 +688,9 @@ document.getElementById('saveCorrectionBtn').addEventListener('click', async () 
       throw new Error(txt || `HTTP ${res.status}`);
     }
     const resp = await res.json();
-    // mark corrected in UI for batch
     if (!singleMode && lastBatchData && lastBatchData.results && lastBatchData.results[currentBatchIndex]) {
       lastBatchData.results[currentBatchIndex].__corrected = true;
     }
-    // If singleMode: show counts in singleResult area
     if (singleMode) {
       let infoHtml = '<h6>Manual counts saved</h6>';
       if (resp.manual_result) {
