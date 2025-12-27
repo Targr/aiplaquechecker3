@@ -523,7 +523,24 @@ document.addEventListener('DOMContentLoaded', () => {
       renderImage();
     }
 
-    /* ---------- Annotation modal + canvas logic (unchanged logic, defensive) ---------- */
+    /* ---------- Annotation modal + canvas logic (updated to fix offset) ---------- */
+
+    // Helper to compute mouse position relative to canvas internal coordinate system (original image coords)
+    function getMousePosOriginal(ev) {
+      // rect = displayed size in CSS pixels
+      const rect = canvas.getBoundingClientRect();
+      // canvas.width/height are the internal pixel dimensions (we set them to canvasImage.width * canvasScale)
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      // mouse position in canvas internal pixels (these are scaled image pixels)
+      const xCanvasPx = (ev.clientX - rect.left) * scaleX;
+      const yCanvasPx = (ev.clientY - rect.top) * scaleY;
+      // convert back to original image coordinates (boxes are stored in original image coords)
+      const origX = xCanvasPx / canvasScale;
+      const origY = yCanvasPx / canvasScale;
+      return { origX, origY, xCanvasPx, yCanvasPx };
+    }
+
     function openAnnotationModal(batchIndex) {
       singleMode = false;
       currentBatchIndex = batchIndex;
@@ -581,39 +598,72 @@ document.addEventListener('DOMContentLoaded', () => {
       if (bsModal) bsModal.show();
     }
 
-    /* Canvas interactions */
+    /* Canvas interactions (fixed to compute positions correctly) */
     if (canvas) {
       canvas.addEventListener('mousedown', (ev) => {
-        const r = canvas.getBoundingClientRect();
-        const x = (ev.clientX - r.left) / canvasScale; const y = (ev.clientY - r.top) / canvasScale;
-        drawing = true; drawStart = { x, y };
+        const pos = getMousePosOriginal(ev);
+        drawing = true;
+        // store start in original-image coordinates (matching boxes format)
+        drawStart = { x: pos.origX, y: pos.origY };
       });
+
       canvas.addEventListener('mousemove', (ev) => {
         if (!drawing) return;
-        const r = canvas.getBoundingClientRect();
-        const x = (ev.clientX - r.left) / canvasScale; const y = (ev.clientY - r.top) / canvasScale;
-        const x1 = Math.min(drawStart.x, x), y1 = Math.min(drawStart.y, y), x2 = Math.max(drawStart.x, x), y2 = Math.max(drawStart.y, y);
+        const pos = getMousePosOriginal(ev);
+        // compute rectangle in original coords
+        const x1 = Math.min(drawStart.x, pos.origX);
+        const y1 = Math.min(drawStart.y, pos.origY);
+        const x2 = Math.max(drawStart.x, pos.origX);
+        const y2 = Math.max(drawStart.y, pos.origY);
+        // redraw canvas and draw the preview rectangle in canvas pixel coordinates
         redrawCanvas();
-        if (ctx) { ctx.strokeStyle = 'lime'; ctx.lineWidth = 2; ctx.strokeRect(x1*canvasScale, y1*canvasScale, (x2-x1)*canvasScale, (y2-y1)*canvasScale); }
+        if (ctx) {
+          const xCanvas = x1 * canvasScale;
+          const yCanvas = y1 * canvasScale;
+          const wCanvas = (x2 - x1) * canvasScale;
+          const hCanvas = (y2 - y1) * canvasScale;
+          ctx.save();
+          ctx.strokeStyle = 'lime';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(xCanvas, yCanvas, wCanvas, hCanvas);
+          ctx.restore();
+        }
       });
+
       canvas.addEventListener('mouseup', (ev) => {
         if (!drawing) return;
         drawing = false;
-        const r = canvas.getBoundingClientRect();
-        const x = (ev.clientX - r.left) / canvasScale; const y = (ev.clientY - r.top) / canvasScale;
-        const x1 = Math.round(Math.min(drawStart.x, x)), y1 = Math.round(Math.min(drawStart.y, y));
-        const x2 = Math.round(Math.max(drawStart.x, x)), y2 = Math.round(Math.max(drawStart.y, y));
+        const pos = getMousePosOriginal(ev);
+        const x1 = Math.round(Math.min(drawStart.x, pos.origX));
+        const y1 = Math.round(Math.min(drawStart.y, pos.origY));
+        const x2 = Math.round(Math.max(drawStart.x, pos.origX));
+        const y2 = Math.round(Math.max(drawStart.y, pos.origY));
         const label_id = parseInt((labelSelect && labelSelect.value) || 0);
-        if (Math.abs(x2-x1) > 4 && Math.abs(y2-y1) > 4) { boxes.push({ x1,y1,x2,y2,label_id }); selectedBoxIdx = boxes.length-1; }
-        updateBoxList(); redrawCanvas();
+        if (Math.abs(x2 - x1) > 4 && Math.abs(y2 - y1) > 4) {
+          boxes.push({ x1, y1, x2, y2, label_id });
+          selectedBoxIdx = boxes.length - 1;
+        }
+        updateBoxList();
+        redrawCanvas();
       });
+
+      // click used for selecting boxes; compute pos in original coords
       canvas.addEventListener('click', (ev) => {
-        const r = canvas.getBoundingClientRect();
-        const x = (ev.clientX - r.left) / canvasScale; const y = (ev.clientY - r.top) / canvasScale;
+        const pos = getMousePosOriginal(ev);
+        const x = pos.origX;
+        const y = pos.origY;
         let found = null;
-        for (let i=boxes.length-1;i>=0;i--) { const b=boxes[i]; if (x>=b.x1 && x<=b.x2 && y>=b.y1 && y<=b.y2) { found=i; break; } }
-        if (found!==null) { selectedBoxIdx = found; if (labelSelect) labelSelect.value = boxes[found].label_id; } else selectedBoxIdx=null;
-        updateBoxList(); redrawCanvas();
+        for (let i = boxes.length - 1; i >= 0; i--) {
+          const b = boxes[i];
+          if (x >= b.x1 && x <= b.x2 && y >= b.y1 && y <= b.y2) { found = i; break; }
+        }
+        if (found !== null) {
+          selectedBoxIdx = found;
+          if (labelSelect) labelSelect.value = boxes[found].label_id;
+        } else selectedBoxIdx = null;
+        updateBoxList();
+        redrawCanvas();
       });
     }
 
@@ -623,16 +673,20 @@ document.addEventListener('DOMContentLoaded', () => {
       ctx.clearRect(0,0,canvas.width,canvas.height);
       if (canvasImage && canvasImage.width) ctx.drawImage(canvasImage, 0, 0, canvas.width, canvas.height);
       boxes.forEach((b, idx) => {
-        const x = b.x1*canvasScale, y = b.y1*canvasScale, w = (b.x2-b.x1)*canvasScale, h = (b.y2-b.y1)*canvasScale;
-        ctx.lineWidth = (idx===selectedBoxIdx)?3:2;
-        ctx.strokeStyle = (idx===selectedBoxIdx)?'red':'yellow';
-        ctx.strokeRect(x,y,w,h);
+        // boxes stored in original image coords, scale them for drawing
+        const x = b.x1 * canvasScale;
+        const y = b.y1 * canvasScale;
+        const w = (b.x2 - b.x1) * canvasScale;
+        const h = (b.y2 - b.y1) * canvasScale;
+        ctx.lineWidth = (idx === selectedBoxIdx) ? 3 : 2;
+        ctx.strokeStyle = (idx === selectedBoxIdx) ? 'red' : 'yellow';
+        ctx.strokeRect(x, y, w, h);
         const lbl = `${b.label_id}:${CLASS_NAMES[b.label_id]||''}`;
         ctx.fillStyle = 'rgba(0,0,0,0.6)';
         const boxW = Math.min(200, ctx.measureText(lbl).width + 8);
-        ctx.fillRect(x, y-18, boxW, 18);
+        ctx.fillRect(x, y - 18, boxW, 18);
         ctx.fillStyle = 'white'; ctx.font = '14px sans-serif';
-        ctx.fillText(lbl, x+4, y-4);
+        ctx.fillText(lbl, x + 4, y - 4);
       });
     }
 
