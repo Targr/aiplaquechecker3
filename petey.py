@@ -612,14 +612,6 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
         overall_progress = 95
         step("finalizing", 95)
 
-        # Compose caveat
-        caveats = []
-        if plates:
-            caveats.append("Plates are assumed not to overlap; if overlapping plates were detected, only the largest overlapping plate was kept.")
-            caveats.append("Plates should be similar in size; circles with radii very different from the group median or with weak rim evidence were excluded.")
-            caveat_text = " ".join(caveats)
-        else:
-            caveat_text = "No valid plates detected (either no circular plates found, rims were weak, or candidate plates failed size/circularity checks)."
 
         # If no plates found, return default single-image response with caveat
         if not plate_results:
