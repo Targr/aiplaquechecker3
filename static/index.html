@@ -354,24 +354,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
           const resp = await postFormData('/api/process', fd);
-          // show returned progress if available
+          // show returned progress if available (briefly)
           const pct = Number(resp.processing_progress || 100);
           updateProgressArea(prog, pct, resp.processing_steps || []);
           setCaveat(prog, resp.plate_detection_caveat || '');
-          // then render results below progress area
-          const resultsHtml = buildResultsHtml(resp);
-          // append results after a small delay for nicer transition
+
+          // After processing is finished, remove the progress UI and show results
           setTimeout(() => {
-            resultDiv.innerHTML = ''; // replace progress area
-            // re-insert progress area with final state + caveat
-            const finalProg = createProgressArea(pct);
-            resultDiv.appendChild(finalProg);
-            updateProgressArea(finalProg, pct, resp.processing_steps || []);
-            setCaveat(finalProg, resp.plate_detection_caveat || '');
-            // append results content
-            const wrapper = document.createElement('div');
-            wrapper.innerHTML = resultsHtml;
-            resultDiv.appendChild(wrapper);
+            // remove progress UI entirely
+            resultDiv.innerHTML = buildResultsHtml(resp);
           }, 350);
         } catch (err) {
           resultDiv.innerHTML = `<div class="text-danger">Error: ${err.message}</div>`;
@@ -391,17 +382,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const pct = Number(resp.processing_progress || 100);
         updateProgressArea(prog, pct, resp.processing_steps || []);
         setCaveat(prog, resp.plate_detection_caveat || '');
-        // render results
+
+        // remove progress UI and display results
         setTimeout(() => {
-          resultDiv.innerHTML = '';
-          const finalProg = createProgressArea(pct);
-          resultDiv.appendChild(finalProg);
-          updateProgressArea(finalProg, pct, resp.processing_steps || []);
-          setCaveat(finalProg, resp.plate_detection_caveat || '');
-          const resultsHtml = buildResultsHtml(resp);
-          const wrapper = document.createElement('div');
-          wrapper.innerHTML = resultsHtml;
-          resultDiv.appendChild(wrapper);
+          resultDiv.innerHTML = buildResultsHtml(resp);
         }, 350);
 
       } catch (err) {
@@ -429,22 +413,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
       try {
         const data = await postFormData('/api/batch', fd);
-        // update global bar to 100% (backend processes synchronously)
+        // update global bar to 100% briefly
         updateProgressArea(globalProg, 100, []);
-        // store lastBatchData and render batch review
+        // store lastBatchData
         lastBatchData = data;
-        // render batch review below progress
+        // remove progress UI and render batch review
         setTimeout(() => {
           resultDiv.innerHTML = '';
-          // show a final global progress and then the batch UI
-          const finalGlobal = createProgressArea(100);
-          resultDiv.appendChild(finalGlobal);
-          updateProgressArea(finalGlobal, 100, []);
-          // attach CSV/ZIP download buttons above batch UI
-          const container = document.createElement('div');
-          container.className = 'mt-3';
-          // CSV & ZIP anchors are included in the renderBatchReview UI; we forward csv/zip b64 up there.
-          resultDiv.appendChild(container);
           renderBatchReview(data);
         }, 300);
       } catch (err) {
@@ -457,23 +432,26 @@ document.addEventListener('DOMContentLoaded', () => {
       // Builds the HTML fragment for results (plates or single).
       let html = '';
       if (data.plates) {
+        if (data.plate_detection_caveat) {
+          html += `<div class="alert alert-warning mt-2" role="alert">${escapeHtml(data.plate_detection_caveat)}</div>`;
+        }
         html += "<h6>Results per Plate:</h6>";
         data.plates.forEach((plate, idx) => {
           html += `<div class="mt-3 p-2 border rounded">
             <h6>Plate ${idx+1}: ${plate.total_features} features</h6>
             <img class="img-preview" src="data:image/png;base64,${plate.annotated_image_base64}">
             <details><summary>Detections</summary><pre>${JSON.stringify(plate.detections, null, 2)}</pre></details>
-            ${plate.color_counts ? '<div><strong>Color counts:</strong><ul>' + Object.entries(plate.color_counts).map(([c,v])=>`<li>${c}: ${v}</li>`).join('') + '</ul></div>' : ''}
+            ${plate.color_counts && Object.keys(plate.color_counts).length ? '<div><strong>Color counts:</strong><ul>' + Object.entries(plate.color_counts).map(([c,v])=>`<li>${c}: ${v}</li>`).join('') + '</ul></div>' : ''}
           </div>`;
         });
-        if (data.plate_detection_caveat) {
-          html = `<div class="alert alert-warning mt-2" role="alert">${escapeHtml(data.plate_detection_caveat)}</div>` + html;
-        }
       } else {
+        if (data.plate_detection_caveat) {
+          html += `<div class="alert alert-warning mt-2" role="alert">${escapeHtml(data.plate_detection_caveat)}</div>`;
+        }
         let imgHtml = `<img class="img-preview" src="data:image/png;base64,${data.annotated_image_base64}">`;
         let detailsHtml = `<details><summary>Detections</summary><pre>${JSON.stringify(data.detections, null, 2)}</pre></details>`;
         let colorHtml = '';
-        if (data.color_counts) colorHtml = '<ul>' + Object.entries(data.color_counts).map(([c,v])=>`<li>${c}: ${v}</li>`).join('') + '</ul>';
+        if (data.color_counts && Object.keys(data.color_counts).length) colorHtml = '<ul>' + Object.entries(data.color_counts).map(([c,v])=>`<li>${c}: ${v}</li>`).join('') + '</ul>';
         html += `<h6>Results:</h6>${imgHtml}${detailsHtml}${colorHtml}`;
       }
       return html;
@@ -490,16 +468,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderResults(data, resultDiv) {
-      // This uses the same builder but also injects caveat and progress if present
-      resultDiv.innerHTML = '';
-      const prog = createProgressArea(Number(data.processing_progress || 100));
-      resultDiv.appendChild(prog);
-      updateProgressArea(prog, Number(data.processing_progress || 100), data.processing_steps || []);
-      setCaveat(prog, data.plate_detection_caveat || '');
-      const resultsHtml = buildResultsHtml(data);
-      const wrapper = document.createElement('div');
-      wrapper.innerHTML = resultsHtml;
-      resultDiv.appendChild(wrapper);
+      // Render final results (no persistent progress UI)
+      resultDiv.innerHTML = buildResultsHtml(data);
     }
 
     function renderBatchReview(data) {
@@ -531,16 +501,11 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
         resultDiv.innerHTML = html;
 
-        // Insert per-image progress area (if available)
+        // Insert detections & color counts (no progress UI — progress removed once processing finished)
         const batchInfoDiv = document.getElementById('batchInfo');
-        const pbar = createProgressArea(Number(imgData.processing_progress || 100));
-        batchInfoDiv.appendChild(pbar);
-        // Make final styling (remove animation and set to value)
-        updateProgressArea(pbar, Number(imgData.processing_progress || 100), imgData.processing_steps || []);
-        setCaveat(pbar, imgData.plate_detection_caveat || '');
-
         let infoHtml = `<details><summary>Detections (${imgData.total_features || (imgData.detections||[]).length})</summary><pre>${JSON.stringify(imgData.detections || [], null, 2)}</pre></details>`;
-        if (imgData.color_counts) infoHtml += '<ul>' + Object.entries(imgData.color_counts).map(([c,v])=>`<li>${c}: ${v}</li>`).join('') + '</ul>';
+        if (imgData.color_counts && Object.keys(imgData.color_counts).length) infoHtml += '<ul>' + Object.entries(imgData.color_counts).map(([c,v])=>`<li>${c}: ${v}</li>`).join('') + '</ul>';
+        if (imgData.plate_detection_caveat) infoHtml = `<div class="alert alert-warning">${escapeHtml(imgData.plate_detection_caveat)}</div>` + infoHtml;
         const infoContainer = document.createElement('div');
         infoContainer.innerHTML = infoHtml;
         batchInfoDiv.appendChild(infoContainer);
