@@ -625,8 +625,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
                 "plates_detected": 0,
                 "plates": [],
                 "processing_steps": steps,
-                "processing_progress": overall_progress,
-                "plate_detection_caveat": caveat_text
+                "processing_progress": overall_progress
             }
 
         step("done", 100)
@@ -639,8 +638,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
             "plates_detected": len(plate_results),
             "plates": plate_results,
             "processing_steps": steps,
-            "processing_progress": overall_progress,
-            "plate_detection_caveat": caveat_text
+            "processing_progress": overall_progress
         }
 
     # default single-plate response (no multi_plate)
