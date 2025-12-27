@@ -156,31 +156,99 @@ def detect_plates_contours(img_rgb: np.ndarray, min_area_ratio: float = 0.02) ->
     candidates = sorted(candidates, key=lambda x: x[2], reverse=True)
     return candidates
 
-def filter_overlapping_circles(circles: List[Tuple[int,int,int]]) -> List[Tuple[int,int,int]]:
+def circle_edge_fraction(img_rgb: np.ndarray, cx: int, cy: int, r: int, sample_step: int = 4) -> float:
     """
-    Remove overlapping circles, keeping only the largest circle when overlaps occur.
+    Compute fraction of sampled points along the circle perimeter that are edges.
+    Helps verify that Hough-detected circle corresponds to visible plate rim.
+    """
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    h, w = gray.shape[:2]
+    pts = []
+    for theta in range(0, 360, sample_step):
+        rad = np.deg2rad(theta)
+        x = int(round(cx + r * np.cos(rad)))
+        y = int(round(cy + r * np.sin(rad)))
+        if 0 <= x < w and 0 <= y < h:
+            pts.append((x, y))
+    if not pts:
+        return 0.0
+    edge_hits = sum(1 for (x, y) in pts if edges[y, x] > 0)
+    return float(edge_hits) / float(len(pts))
 
-    circles: list of (cx, cy, r) — assumed not necessarily sorted
-    returns: filtered list of circles (sorted by radius desc)
+def filter_overlapping_by_detection(plates: List[Tuple[int,int,int]], detections: List[Dict[str, Any]]) -> List[Tuple[int,int,int]]:
+    """
+    Remove overlapping plates when overlap is defined as sharing detections.
+    If two plates share any detection, keep only the larger radius plate.
+    plates: list of (cx,cy,r)
+    detections: list of dicts with center_x, center_y
+    """
+    if not plates:
+        return []
+    # build detection sets per plate
+    plate_det_sets = []
+    for (cx, cy, r) in plates:
+        idxs = set()
+        for i, d in enumerate(detections):
+            dx, dy = d.get("center_x"), d.get("center_y")
+            if dx is None or dy is None:
+                continue
+            if (dx - cx) ** 2 + (dy - cy) ** 2 <= r * r:
+                idxs.add(i)
+        plate_det_sets.append(idxs)
+
+    keep = [True] * len(plates)
+    # compare pairs; if intersection non-empty, discard smaller
+    for i in range(len(plates)):
+        for j in range(i+1, len(plates)):
+            if not keep[i] or not keep[j]:
+                continue
+            if plate_det_sets[i] & plate_det_sets[j]:
+                # overlap - remove smaller radius
+                if plates[i][2] >= plates[j][2]:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+    filtered = [p for k,p in zip(keep, plates) if k]
+    return filtered
+
+def filter_overlapping_circles_keep_largest(circles: List[Tuple[int,int,int]]) -> List[Tuple[int,int,int]]:
+    """
+    Remove overlapping circles based on center-distance overlap (simple geometric overlap),
+    keeping only the largest circle in overlapping groups.
     """
     if not circles:
         return []
-
-    # Sort by radius descending (largest first)
-    circles_sorted = sorted(circles, key=lambda c: c[2], reverse=True)
-    kept: List[Tuple[int,int,int]] = []
-
-    for cx, cy, r in circles_sorted:
-        overlap_found = False
+    circles = sorted(circles, key=lambda c: c[2], reverse=True)  # largest first
+    kept = []
+    for cx, cy, r in circles:
+        overlaps = False
         for kx, ky, kr in kept:
             dist_sq = (cx - kx) ** 2 + (cy - ky) ** 2
-            # overlap if distance < (r + kr)
-            if dist_sq < (r + kr) ** 2:
-                overlap_found = True
+            # consider overlapping if centers closer than sum of radii * 0.9 (slight tolerance)
+            if dist_sq < (r + kr) ** 2 * 0.81:
+                overlaps = True
                 break
-        if not overlap_found:
+        if not overlaps:
             kept.append((cx, cy, r))
     return kept
+
+def filter_by_size_uniformity(plates: List[Tuple[int,int,int]], tolerance: float = 0.4) -> List[Tuple[int,int,int]]:
+    """
+    Keep plates whose radius is within +/- tolerance relative to median radius.
+    tolerance 0.4 means keep radii in [median*(1-0.4), median*(1+0.4)].
+    If only one plate, keep it regardless.
+    """
+    if not plates:
+        return []
+    if len(plates) == 1:
+        return plates
+    radii = np.array([r for (_,_,r) in plates], dtype=float)
+    med = np.median(radii)
+    low = med * (1 - tolerance)
+    high = med * (1 + tolerance)
+    filtered = [p for p in plates if (p[2] >= low and p[2] <= high)]
+    return filtered
 
 # --------- Core YOLO Processing with Deduplication ---------
 def process_yolo(image_bytes: bytes, conf_threshold: float) -> Tuple[List[Dict[str, Any]], np.ndarray]:
@@ -328,21 +396,35 @@ def process_manual_boxes_from_bytes(image_bytes: bytes, boxes: List[Dict[str, An
         "color_counts": color_counts
     }
 
-# --------- Core Processing (now supports multi_plate grouping with overlap caveat) ---------
+# --------- Core Processing (now supports multi_plate grouping + caveats + progress) ---------
 def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_bytes: List[Tuple[str, bytes]]) -> Dict[str, Any]:
     """
-    Returns dictionary. If params.get("multi_plate") is truthy, the response will try to include:
+    Returns dictionary. If params.get("multi_plate") is truthy, the response will include:
       "plates": [ { plate_id, center, radius, total_features, detections, color_counts, annotated_image_base64 }, ... ]
     Otherwise returns standard:
       "detections", "annotated_image_base64", "original_image_base64", "color_counts"
 
-    Caveat: plate circles are assumed not to overlap. If overlapping circles are detected,
-    only the largest circle is kept (smaller overlapping circles are discarded).
+    Additional fields:
+      "processing_steps": list of step dicts with 'name' and 'progress' (0..100)
+      "processing_progress": overall percent (0..100)
+      "plate_detection_caveat": textual caveat info (if relevant)
     """
+    # progress scaffolding
+    steps = []
+    def step(name: str, pct: int):
+        steps.append({"step": name, "progress": pct})
+    overall_progress = 0
+
     conf_threshold = float(params.get("confidence", 0.25))
     multi_plate = bool(params.get("multi_plate", False))
 
+    step("start", 0)
+    # 1) YOLO detection
+    step("yolo_detection", 10)
     detections, img_rgb = process_yolo(image_bytes, conf_threshold)
+    step("yolo_detection", 30)
+    overall_progress = 30
+
     annotated_default = annotate_image_yolo(img_rgb, detections)
     annotated_b64 = pil_to_base64(annotated_default)
 
@@ -353,6 +435,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
     except Exception:
         original_b64 = annotated_b64
 
+    # color map selected by user
     color_counts = {}
     user_colors = params.get("colors")
     selected_map = {}
@@ -366,17 +449,52 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
         }
         selected_map = {c: color_map[c] for c in user_colors if c in color_map}
         if selected_map:
+            step("color_counting", 35)
             color_counts = count_detections_by_color(img_rgb, detections, selected_map)
+            step("color_counting", 45)
+    overall_progress = max(overall_progress, 45)
+
+    plate_detection_caveat = None
 
     # If multi_plate requested, detect plates and group
     if multi_plate:
+        step("plate_detection", 50)
         # Try Hough first, fallback to contours
         plates = detect_plates_hough(img_rgb)
-        if not plates:
+        # apply quick edge verification for Hough circles (filter weak rims)
+        verified_hough = []
+        for (cx, cy, r) in plates:
+            frac = circle_edge_fraction(img_rgb, cx, cy, r, sample_step=6)
+            # require at least 25-30% of perimeter to have edge response to be considered a real rim
+            if frac >= 0.25:
+                verified_hough.append((cx, cy, r))
+        if verified_hough:
+            plates = verified_hough
+        else:
+            # fallback to contours if Hough not trustworthy
             plates = detect_plates_contours(img_rgb)
 
-        # Caveat: if overlapping circles are detected, only keep the largest one(s)
-        plates = filter_overlapping_circles(plates)
+        step("plate_detection", 70)
+        overall_progress = 70
+
+        # Remove obviously tiny candidates (already roughly handled) — and require size uniformity
+        if plates:
+            # filter by size uniformity: keep only radii within +/-40% of median radius
+            plates = filter_by_size_uniformity(plates, tolerance=0.4)
+            # If still many, remove overlapping geometrically keeping largest
+            plates = filter_overlapping_circles_keep_largest(plates)
+
+        # After that, we must ensure overlap in the sense of "sharing same detection" does not happen.
+        # If two plates would contain the same detection, drop the smaller one (caveat rule).
+        if plates:
+            plates = filter_overlapping_by_detection(plates, detections)
+
+        # Additional filtering: require plates to be of similar dimensions (if more than 1 plate)
+        if plates and len(plates) > 1:
+            plates = filter_by_size_uniformity(plates, tolerance=0.4)
+
+        step("plate_detection", 85)
+        overall_progress = 85
 
         plate_results = []
         # initialize empty list of detections per plate
@@ -390,7 +508,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
                 "color_counts": {}
             })
 
-        # assign each detection to nearest plate center if inside any circle
+        # assign each detection to the nearest plate center if inside any circle
         for det in detections:
             px, py = det["center_x"], det["center_y"]
             assigned_idx = None
@@ -404,6 +522,25 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
                         assigned_idx = i
             if assigned_idx is not None:
                 plate_results[assigned_idx]["detections"].append(det)
+
+        # If any plates still share a detection (shouldn't after previous filter), enforce rule: keep only largest plate group
+        # Build detection index sets per plate and remove smaller plates if intersections exist
+        if plate_results:
+            det_sets = [set((d["center_x"], d["center_y"]) for d in pr["detections"]) for pr in plate_results]
+            keep_flags = [True] * len(plate_results)
+            for i in range(len(plate_results)):
+                for j in range(i+1, len(plate_results)):
+                    if not keep_flags[i] or not keep_flags[j]:
+                        continue
+                    if det_sets[i] & det_sets[j]:
+                        # overlapping (share at least one detection) => drop smaller
+                        ri = plate_results[i]["radius"] if "radius" in plate_results[i] else 0
+                        rj = plate_results[j]["radius"] if "radius" in plate_results[j] else 0
+                        if ri >= rj:
+                            keep_flags[j] = False
+                        else:
+                            keep_flags[i] = False
+            plate_results = [p for k,p in zip(keep_flags, plate_results) if k]
 
         # fill totals and per-plate annotations & color counts
         for pr in plate_results:
@@ -421,32 +558,59 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
             annotated_pil = annotate_image_with_boxes(img_rgb, boxes_for_draw, circle_overlays=circle_overlay)
             pr["annotated_image_base64"] = pil_to_base64(annotated_pil)
 
-        # If no plates found, fall back to default single-image output (so frontend still works)
+        overall_progress = 95
+        step("finalizing", 95)
+
+        # Caveat message if any plates were filtered out due to overlap or size mismatch
+        caveats = []
+        if plates:
+            # check if initial Hough found overlapping centers or widely varying radii that caused filtering
+            caveats.append("Plates are assumed not to overlap; if overlapping plates were detected, only the largest overlapping plate was kept.")
+            caveats.append("Plates should be similar in size; circles with radii very different from the group median or with weak rim evidence were excluded.")
+            caveat_text = " ".join(caveats)
+        else:
+            caveat_text = "No valid plates detected (either no circular plates found, rims were weak, or candidate plates failed size/circularity checks)."
+
+        # If no plates found, return default single-image response with caveat
         if not plate_results:
+            step("done", 100)
+            overall_progress = 100
             return {
                 "detections": detections,
                 "annotated_image_base64": annotated_b64,
                 "original_image_base64": original_b64,
                 "color_counts": color_counts,
                 "plates_detected": 0,
-                "plates": []
+                "plates": [],
+                "processing_steps": steps,
+                "processing_progress": overall_progress,
+                "plate_detection_caveat": caveat_text
             }
 
+        step("done", 100)
+        overall_progress = 100
         return {
             "detections": detections,
             "annotated_image_base64": annotated_b64,
             "original_image_base64": original_b64,
             "color_counts": color_counts,
             "plates_detected": len(plate_results),
-            "plates": plate_results
+            "plates": plate_results,
+            "processing_steps": steps,
+            "processing_progress": overall_progress,
+            "plate_detection_caveat": caveat_text
         }
 
-    # default single-plate response
+    # default single-plate response (no multi_plate)
+    step("done", 100)
+    overall_progress = 100
     return {
         "detections": detections,
         "annotated_image_base64": annotated_b64,
         "original_image_base64": original_b64,
-        "color_counts": color_counts
+        "color_counts": color_counts,
+        "processing_steps": steps,
+        "processing_progress": overall_progress
     }
 
 # --------- Filesystem helpers for supplemental data ---------
@@ -609,7 +773,9 @@ def api_batch():
                     "plates": result.get("plates", []),
                     "color_counts": result.get("color_counts", {}),
                     "annotated_image_base64": result.get("annotated_image_base64"),
-                    "original_image_base64": result.get("original_image_base64")
+                    "original_image_base64": result.get("original_image_base64"),
+                    "processing_progress": result.get("processing_progress", 100),
+                    "plate_detection_caveat": result.get("plate_detection_caveat")
                 })
                 # write annotated image(s) into zip; if plates exist write per-plate images, else the single annotated image
                 if result.get("plates"):
