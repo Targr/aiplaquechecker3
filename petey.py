@@ -156,6 +156,32 @@ def detect_plates_contours(img_rgb: np.ndarray, min_area_ratio: float = 0.02) ->
     candidates = sorted(candidates, key=lambda x: x[2], reverse=True)
     return candidates
 
+def filter_overlapping_circles(circles: List[Tuple[int,int,int]]) -> List[Tuple[int,int,int]]:
+    """
+    Remove overlapping circles, keeping only the largest circle when overlaps occur.
+
+    circles: list of (cx, cy, r) — assumed not necessarily sorted
+    returns: filtered list of circles (sorted by radius desc)
+    """
+    if not circles:
+        return []
+
+    # Sort by radius descending (largest first)
+    circles_sorted = sorted(circles, key=lambda c: c[2], reverse=True)
+    kept: List[Tuple[int,int,int]] = []
+
+    for cx, cy, r in circles_sorted:
+        overlap_found = False
+        for kx, ky, kr in kept:
+            dist_sq = (cx - kx) ** 2 + (cy - ky) ** 2
+            # overlap if distance < (r + kr)
+            if dist_sq < (r + kr) ** 2:
+                overlap_found = True
+                break
+        if not overlap_found:
+            kept.append((cx, cy, r))
+    return kept
+
 # --------- Core YOLO Processing with Deduplication ---------
 def process_yolo(image_bytes: bytes, conf_threshold: float) -> Tuple[List[Dict[str, Any]], np.ndarray]:
     arr = np.asarray(bytearray(image_bytes), dtype=np.uint8)
@@ -302,13 +328,16 @@ def process_manual_boxes_from_bytes(image_bytes: bytes, boxes: List[Dict[str, An
         "color_counts": color_counts
     }
 
-# --------- Core Processing (now supports multi_plate grouping) ---------
+# --------- Core Processing (now supports multi_plate grouping with overlap caveat) ---------
 def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_bytes: List[Tuple[str, bytes]]) -> Dict[str, Any]:
     """
     Returns dictionary. If params.get("multi_plate") is truthy, the response will try to include:
       "plates": [ { plate_id, center, radius, total_features, detections, color_counts, annotated_image_base64 }, ... ]
     Otherwise returns standard:
       "detections", "annotated_image_base64", "original_image_base64", "color_counts"
+
+    Caveat: plate circles are assumed not to overlap. If overlapping circles are detected,
+    only the largest circle is kept (smaller overlapping circles are discarded).
     """
     conf_threshold = float(params.get("confidence", 0.25))
     multi_plate = bool(params.get("multi_plate", False))
@@ -346,24 +375,8 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
         if not plates:
             plates = detect_plates_contours(img_rgb)
 
-        # Only keep the largest N circles if many are found (N optional, keep all by default)
-        # We'll keep circles reasonably large and not overlapping duplicates:
-        filtered_plates = []
-        used_centers = []
-        for (cx, cy, r) in plates:
-            # ignore if near an existing center (duplicate)
-            too_close = False
-            for (ucx, ucy, ur) in used_centers:
-                dist = np.hypot(cx - ucx, cy - ucy)
-                if dist < max(10, ur * 0.4):
-                    too_close = True
-                    break
-            if too_close:
-                continue
-            filtered_plates.append((cx, cy, r))
-            used_centers.append((cx, cy, r))
-
-        plates = filtered_plates
+        # Caveat: if overlapping circles are detected, only keep the largest one(s)
+        plates = filter_overlapping_circles(plates)
 
         plate_results = []
         # initialize empty list of detections per plate
