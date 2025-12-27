@@ -303,22 +303,21 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // multi-plate => get detections then open modal for manual splitting
+      // multi-plate => let backend detect plates and group detections; DO NOT open annotation modal
       try {
         const fd = new FormData();
         fd.append('image', file);
         fd.append('confidence', conf);
         fd.append('colors', colors);
         fd.append('multi_plate', 'true');
-        document.getElementById('singleResult').innerHTML = 'Processing (getting detections)...';
+        const resultDiv = document.getElementById('singleResult');
+        resultDiv.innerHTML = 'Processing (multi-plate detection)...';
         const resp = await postFormData('/api/process', fd);
-        const imgB64 = resp.original_image_base64 || resp.annotated_image_base64;
-        const detections = resp.detections || [];
-        singleMode = true;
-        singleImageB64 = imgB64.startsWith('data:') ? imgB64.split(',')[1] : imgB64;
-        singleImageName = file.name || 'single_image';
-        openAnnotationModalForSingle(singleImageB64, singleImageName, detections);
-        document.getElementById('singleResult').innerHTML = `<div class="text-success">Detections loaded into editor (${detections.length}). Draw additional boxes if needed, then Save.</div>`;
+
+        // Backend should return resp.plates if it detected multiple plates.
+        // renderResults already supports a "plates" array response structure.
+        renderResults(resp, resultDiv);
+
       } catch (err) {
         document.getElementById('singleResult').innerHTML = `<div class="text-danger">Error getting detections: ${err.message}</div>`;
       }
