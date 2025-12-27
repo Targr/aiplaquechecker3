@@ -86,28 +86,63 @@ def annotate_image_with_boxes(img: np.ndarray, boxes: List[Dict[str, Any]], circ
             draw.text((x1, max(0, y1 - 10)), text, fill=(255, 255, 0), font=font)
     return pil
 
-# --------- Helper: Plate detection (circle detection) ---------
-def detect_plates_hough(img_rgb: np.ndarray, min_radius_ratio: float = 0.08, max_radius_ratio: float = 0.45, dp: float = 1.2, param1: int = 100, param2: int = 30) -> List[Tuple[int,int,int]]:
+# --------- Helper: Plate detection (optimized Hough) ---------
+def detect_plates_hough(
+    img_rgb: np.ndarray,
+    max_dim: int = 800,
+    expected_radius_px: Optional[float] = None,
+    min_radius_ratio: float = 0.06,
+    max_radius_ratio: float = 0.5,
+    dp: float = 1.2,
+    param1: int = 100,
+    param2: int = 40
+) -> List[Tuple[int,int,int]]:
     """
-    Detect circular plates using HoughCircles.
-    Returns list of (cx, cy, radius) sorted by radius desc.
+    Optimized HoughCircles detection:
+      - downscales large images to `max_dim` width for speed
+      - if expected_radius_px is provided (in original-image pixels), it tightens min/max radius
+      - uses median blur with small kernel
+      - returns (cx,cy,r) in ORIGINAL image coordinates (scaled back)
     """
-    img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    # equalize + blur to make circles stronger
-    img_gray = cv2.equalizeHist(img_gray)
-    img_blur = cv2.medianBlur(img_gray, 9)
+    h0, w0 = img_rgb.shape[:2]
 
-    h, w = img_gray.shape[:2]
+    # compute scale to downsample for Hough
+    scale = 1.0
+    if max(w0, h0) > max_dim:
+        scale = max_dim / max(w0, h0)
+
+    w = max(1, int(round(w0 * scale)))
+    h = max(1, int(round(h0 * scale)))
+    img_small = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_AREA) if scale != 1.0 else img_rgb.copy()
+
+    gray = cv2.cvtColor(img_small, cv2.COLOR_RGB2GRAY)
+    # equalize + median blur with small kernel for speed
+    gray = cv2.equalizeHist(gray)
+    gray_blur = cv2.medianBlur(gray, 5)
+
     min_dim = min(h, w)
-    minRadius = max(5, int(min_dim * min_radius_ratio))
-    maxRadius = max(10, int(min_dim * max_radius_ratio))
+    # derive min/max radius in *scaled* pixels
+    if expected_radius_px is not None and expected_radius_px > 0:
+        expected_scaled = max(5, int(round(expected_radius_px * scale)))
+        minRadius = max(5, int(expected_scaled * 0.6))
+        maxRadius = max(10, int(expected_scaled * 1.6))
+    else:
+        minRadius = max(5, int(min_dim * min_radius_ratio))
+        maxRadius = max(10, int(min_dim * max_radius_ratio))
+
+    # Ensure minRadius <= maxRadius and sane bounds
+    minRadius = max(3, min(minRadius, min_dim//2))
+    maxRadius = max(minRadius+1, min(maxRadius, min_dim//1))
+
+    # set minDist proportional to expected radius to avoid repeated close detections
+    minDist = max(10, int(minRadius * 0.9))
 
     try:
         circles = cv2.HoughCircles(
-            img_blur,
+            gray_blur,
             cv2.HOUGH_GRADIENT,
             dp=dp,
-            minDist=int(min_dim * 0.25),
+            minDist=minDist,
             param1=param1,
             param2=param2,
             minRadius=minRadius,
@@ -118,15 +153,42 @@ def detect_plates_hough(img_rgb: np.ndarray, min_radius_ratio: float = 0.08, max
 
     out = []
     if circles is not None:
+        # round and convert back to original image coordinates
         circles = np.round(circles[0, :]).astype("int")
-        # sort by radius desc (largest first)
-        circles_sorted = sorted([(int(cx), int(cy), int(r)) for cx, cy, r in circles], key=lambda x: x[2], reverse=True)
-        out = circles_sorted
+        for cx_s, cy_s, r_s in circles:
+            # scale back
+            cx = int(round(cx_s / scale))
+            cy = int(round(cy_s / scale))
+            r = int(round(r_s / scale))
+            out.append((cx, cy, r))
+        # sort by radius desc
+        out = sorted(out, key=lambda x: x[2], reverse=True)
     return out
 
+def circle_edge_fraction_scaled(small_img_rgb: np.ndarray, cx_s: int, cy_s: int, r_s: int, sample_step: int = 6) -> float:
+    """
+    Compute edge fraction on the scaled-down image (fast).
+    Inputs are in scaled-image pixels.
+    """
+    gray = cv2.cvtColor(small_img_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    h, w = gray.shape[:2]
+    pts = []
+    for theta in range(0, 360, sample_step):
+        rad = np.deg2rad(theta)
+        x = int(round(cx_s + r_s * np.cos(rad)))
+        y = int(round(cy_s + r_s * np.sin(rad)))
+        if 0 <= x < w and 0 <= y < h:
+            pts.append((x, y))
+    if not pts:
+        return 0.0
+    edge_hits = sum(1 for (x, y) in pts if edges[y, x] > 0)
+    return float(edge_hits) / float(len(pts))
+
+# Keep contour fallback but Hough is final and preferred; contours are only used if Hough fails
 def detect_plates_contours(img_rgb: np.ndarray, min_area_ratio: float = 0.02) -> List[Tuple[int,int,int]]:
     """
-    Alternative contour-based detection for circular-ish plates.
+    Alternative contour-based detection for circular-ish plates (fallback).
     Returns list of (cx, cy, radius)
     """
     gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
@@ -156,32 +218,10 @@ def detect_plates_contours(img_rgb: np.ndarray, min_area_ratio: float = 0.02) ->
     candidates = sorted(candidates, key=lambda x: x[2], reverse=True)
     return candidates
 
-def circle_edge_fraction(img_rgb: np.ndarray, cx: int, cy: int, r: int, sample_step: int = 4) -> float:
-    """
-    Compute fraction of sampled points along the circle perimeter that are edges.
-    Helps verify that Hough-detected circle corresponds to visible plate rim.
-    """
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    h, w = gray.shape[:2]
-    pts = []
-    for theta in range(0, 360, sample_step):
-        rad = np.deg2rad(theta)
-        x = int(round(cx + r * np.cos(rad)))
-        y = int(round(cy + r * np.sin(rad)))
-        if 0 <= x < w and 0 <= y < h:
-            pts.append((x, y))
-    if not pts:
-        return 0.0
-    edge_hits = sum(1 for (x, y) in pts if edges[y, x] > 0)
-    return float(edge_hits) / float(len(pts))
-
 def filter_overlapping_by_detection(plates: List[Tuple[int,int,int]], detections: List[Dict[str, Any]]) -> List[Tuple[int,int,int]]:
     """
     Remove overlapping plates when overlap is defined as sharing detections.
     If two plates share any detection, keep only the larger radius plate.
-    plates: list of (cx,cy,r)
-    detections: list of dicts with center_x, center_y
     """
     if not plates:
         return []
@@ -236,7 +276,6 @@ def filter_overlapping_circles_keep_largest(circles: List[Tuple[int,int,int]]) -
 def filter_by_size_uniformity(plates: List[Tuple[int,int,int]], tolerance: float = 0.4) -> List[Tuple[int,int,int]]:
     """
     Keep plates whose radius is within +/- tolerance relative to median radius.
-    tolerance 0.4 means keep radii in [median*(1-0.4), median*(1+0.4)].
     If only one plate, keep it regardless.
     """
     if not plates:
@@ -250,7 +289,7 @@ def filter_by_size_uniformity(plates: List[Tuple[int,int,int]], tolerance: float
     filtered = [p for p in plates if (p[2] >= low and p[2] <= high)]
     return filtered
 
-# --------- Core YOLO Processing with Deduplication ---------
+# --------- Core YOLO Processing with Deduplication (unchanged except Hough runs last & optimized) ---------
 def process_yolo(image_bytes: bytes, conf_threshold: float) -> Tuple[List[Dict[str, Any]], np.ndarray]:
     arr = np.asarray(bytearray(image_bytes), dtype=np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -396,7 +435,7 @@ def process_manual_boxes_from_bytes(image_bytes: bytes, boxes: List[Dict[str, An
         "color_counts": color_counts
     }
 
-# --------- Core Processing (now supports multi_plate grouping + caveats + progress) ---------
+# --------- Core Processing (Hough is the final step; optimized for speed) ---------
 def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_bytes: List[Tuple[str, bytes]]) -> Dict[str, Any]:
     """
     Returns dictionary. If params.get("multi_plate") is truthy, the response will include:
@@ -405,7 +444,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
       "detections", "annotated_image_base64", "original_image_base64", "color_counts"
 
     Additional fields:
-      "processing_steps": list of step dicts with 'name' and 'progress' (0..100)
+      "processing_steps": list of step dicts with 'step' and 'progress' (0..100)
       "processing_progress": overall percent (0..100)
       "plate_detection_caveat": textual caveat info (if relevant)
     """
@@ -419,7 +458,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
     multi_plate = bool(params.get("multi_plate", False))
 
     step("start", 0)
-    # 1) YOLO detection
+    # 1) YOLO detection (unchanged, must not be altered)
     step("yolo_detection", 10)
     detections, img_rgb = process_yolo(image_bytes, conf_threshold)
     step("yolo_detection", 30)
@@ -435,7 +474,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
     except Exception:
         original_b64 = annotated_b64
 
-    # color map selected by user
+    # color map selected by user (runs before Hough, does not alter detection list)
     color_counts = {}
     user_colors = params.get("colors")
     selected_map = {}
@@ -456,48 +495,78 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
 
     plate_detection_caveat = None
 
-    # If multi_plate requested, detect plates and group
+    # If multi_plate requested, Hough detection is performed as the FINAL step and is optimized for speed.
     if multi_plate:
-        step("plate_detection", 50)
-        # Try Hough first, fallback to contours
-        plates = detect_plates_hough(img_rgb)
-        # apply quick edge verification for Hough circles (filter weak rims)
-        verified_hough = []
-        for (cx, cy, r) in plates:
-            frac = circle_edge_fraction(img_rgb, cx, cy, r, sample_step=6)
-            # require at least 25-30% of perimeter to have edge response to be considered a real rim
-            if frac >= 0.25:
-                verified_hough.append((cx, cy, r))
-        if verified_hough:
-            plates = verified_hough
-        else:
-            # fallback to contours if Hough not trustworthy
+        step("prepare_hough", 50)
+
+        # Estimate expected radius from detections when possible (helps narrow Hough search)
+        expected_radius_px = None
+        try:
+            if detections:
+                centers = np.array([[d["center_x"], d["center_y"]] for d in detections], dtype=float)
+                minx, miny = centers.min(axis=0)
+                maxx, maxy = centers.max(axis=0)
+                # estimate plate radius as ~0.6 * half of bounding box of detections (conservative)
+                bbox_w = maxx - minx
+                bbox_h = maxy - miny
+                est = max(bbox_w, bbox_h) * 0.9  # spread of detections tends to be smaller than plate diameter; use 0.9 multiplier
+                if est > 8:
+                    expected_radius_px = float(est / 2.0)
+        except Exception:
+            expected_radius_px = None
+
+        step("plate_detection_hough", 60)
+        overall_progress = 60
+
+        # Run optimized Hough on resized image (internally scales back coordinates)
+        plates = detect_plates_hough(img_rgb, max_dim=900, expected_radius_px=expected_radius_px, dp=1.2, param1=100, param2=40)
+
+        # quick verification using edge fraction on a scaled down image for speed.
+        verified = []
+        if plates:
+            # prepare small image used by detect_plates_hough (same scale) for fast edge checks
+            # compute scale used inside detect_plates_hough
+            h0, w0 = img_rgb.shape[:2]
+            scale = 1.0
+            if max(w0, h0) > 900:
+                scale = 900 / max(w0, h0)
+            small_img = cv2.resize(img_rgb, (max(1, int(round(w0*scale))), max(1, int(round(h0*scale)))), interpolation=cv2.INTER_AREA) if scale != 1.0 else img_rgb.copy()
+            for (cx, cy, r) in plates:
+                # map center/radius to scaled coords
+                cx_s = int(round(cx * scale))
+                cy_s = int(round(cy * scale))
+                r_s = max(3, int(round(r * scale)))
+                frac = circle_edge_fraction_scaled(small_img, cx_s, cy_s, r_s, sample_step=6)
+                # require at least 20-25% edge presence
+                if frac >= 0.20:
+                    verified.append((cx, cy, r))
+            if verified:
+                plates = verified
+
+        # If Hough did not find plates, optionally fallback to contours (rare)
+        if not plates:
             plates = detect_plates_contours(img_rgb)
 
-        step("plate_detection", 70)
-        overall_progress = 70
+        step("plate_filtering", 75)
+        overall_progress = 75
 
-        # Remove obviously tiny candidates (already roughly handled) — and require size uniformity
+        # filter by size uniformity (plates should be similar size)
         if plates:
-            # filter by size uniformity: keep only radii within +/-40% of median radius
-            plates = filter_by_size_uniformity(plates, tolerance=0.4)
-            # If still many, remove overlapping geometrically keeping largest
+            plates = filter_by_size_uniformity(plates, tolerance=0.45)
             plates = filter_overlapping_circles_keep_largest(plates)
 
-        # After that, we must ensure overlap in the sense of "sharing same detection" does not happen.
-        # If two plates would contain the same detection, drop the smaller one (caveat rule).
+        # ensure "no-sharing-detections" rule: if two plates contain same detection, drop the smaller
         if plates:
             plates = filter_overlapping_by_detection(plates, detections)
 
-        # Additional filtering: require plates to be of similar dimensions (if more than 1 plate)
+        # final size uniformity pass
         if plates and len(plates) > 1:
-            plates = filter_by_size_uniformity(plates, tolerance=0.4)
+            plates = filter_by_size_uniformity(plates, tolerance=0.45)
 
-        step("plate_detection", 85)
+        step("assign_detections", 85)
         overall_progress = 85
 
         plate_results = []
-        # initialize empty list of detections per plate
         for pid, (cx, cy, r) in enumerate(plates, start=1):
             plate_results.append({
                 "plate_id": pid,
@@ -508,7 +577,7 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
                 "color_counts": {}
             })
 
-        # assign each detection to the nearest plate center if inside any circle
+        # assign detections to plates (no change to detection list)
         for det in detections:
             px, py = det["center_x"], det["center_y"]
             assigned_idx = None
@@ -523,34 +592,16 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
             if assigned_idx is not None:
                 plate_results[assigned_idx]["detections"].append(det)
 
-        # If any plates still share a detection (shouldn't after previous filter), enforce rule: keep only largest plate group
-        # Build detection index sets per plate and remove smaller plates if intersections exist
-        if plate_results:
-            det_sets = [set((d["center_x"], d["center_y"]) for d in pr["detections"]) for pr in plate_results]
-            keep_flags = [True] * len(plate_results)
-            for i in range(len(plate_results)):
-                for j in range(i+1, len(plate_results)):
-                    if not keep_flags[i] or not keep_flags[j]:
-                        continue
-                    if det_sets[i] & det_sets[j]:
-                        # overlapping (share at least one detection) => drop smaller
-                        ri = plate_results[i]["radius"] if "radius" in plate_results[i] else 0
-                        rj = plate_results[j]["radius"] if "radius" in plate_results[j] else 0
-                        if ri >= rj:
-                            keep_flags[j] = False
-                        else:
-                            keep_flags[i] = False
-            plate_results = [p for k,p in zip(keep_flags, plate_results) if k]
+        # Remove any plates that ended up with zero detections (they might be false positives after filtering)
+        plate_results = [p for p in plate_results if p["detections"]]
 
-        # fill totals and per-plate annotations & color counts
+        # fill totals and create per-plate annotated images
         for pr in plate_results:
             pr["total_features"] = len(pr["detections"])
-            # per-plate color counting
             if selected_map:
                 pr["color_counts"] = count_detections_by_color(img_rgb, pr["detections"], selected_map)
             else:
                 pr["color_counts"] = {}
-            # create an annotated image for this plate: draw plate circle + only detections for plate
             circle_overlay = [(pr["center"][0], pr["center"][1], pr["radius"], pr["plate_id"])]
             boxes_for_draw = []
             for d in pr["detections"]:
@@ -561,10 +612,9 @@ def process_single_image(image_bytes: bytes, params: Dict[str, Any], reference_b
         overall_progress = 95
         step("finalizing", 95)
 
-        # Caveat message if any plates were filtered out due to overlap or size mismatch
+        # Compose caveat
         caveats = []
         if plates:
-            # check if initial Hough found overlapping centers or widely varying radii that caused filtering
             caveats.append("Plates are assumed not to overlap; if overlapping plates were detected, only the largest overlapping plate was kept.")
             caveats.append("Plates should be similar in size; circles with radii very different from the group median or with weak rim evidence were excluded.")
             caveat_text = " ".join(caveats)
@@ -656,7 +706,7 @@ def save_yolo_label_file(label_path: str, boxes: List[Dict[str, Any]], img_w: in
     with open(label_path, "w") as fh:
         fh.write("\n".join(lines))
 
-# --------- Routes ---------
+# --------- Routes (unchanged) ---------
 @app.route("/")
 def root():
     # serve static/index.html from your static folder
